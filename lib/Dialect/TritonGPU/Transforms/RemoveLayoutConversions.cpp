@@ -1333,14 +1333,49 @@ void LayoutRematerialization::hoistConvertDotOperand(
   if (result.failed())
     return;
 
+  // Before sm_80 the pipeliner prefetches the next tile into registers: the
+  // load becomes a loop-carried value whose yield is the load. Converting that
+  // value at the top of the loop body keeps a narrow tile (an 8-bit weight)
+  // narrow through shared memory instead of converting its widened result.
+  // Volta's MMAv1 operands hold every element in several threads, so decoding
+  // there would repeat the work (V100 W8A16 prefill measured 1.7x slower); its
+  // operands keep being converted after the decode.
+  auto dotEnc = dyn_cast<DotOperandEncodingAttr>(targetType.getEncoding());
+  auto mmaParent =
+      dotEnc ? dyn_cast<NvidiaMmaEncodingAttr>(dotEnc.getParent()) : nullptr;
+  bool narrowThroughShared = mmaParent && !mmaParent.isVolta();
+  auto registerPipelinedLoad = [&](Value v) -> bool {
+    if (!narrowThroughShared)
+      return false;
+    auto arg = dyn_cast<BlockArgument>(v);
+    if (!arg)
+      return false;
+    auto forOp = dyn_cast<scf::ForOp>(arg.getOwner()->getParentOp());
+    if (!forOp || arg.getArgNumber() < forOp.getNumInductionVars())
+      return false;
+    Value yielded = forOp.getYieldedValues()[arg.getArgNumber() -
+                                             forOp.getNumInductionVars()];
+    return yielded.getDefiningOp<LoadOp>() != nullptr;
+  };
+
   IRMapping mapping;
   OpBuilder builder(convertOp.getContext());
   SetVector<Value> innerSlice;
   for (Value v : slice) {
     if (!v.getDefiningOp()) {
-      LLVM_DEBUG(
-          { DBGS() << "  Block arguments not supported. Got " << v << "\n"; });
-      return;
+      if (!registerPipelinedLoad(v)) {
+        LLVM_DEBUG(
+            { DBGS() << "  Block arguments not supported. Got " << v << "\n"; });
+        return;
+      }
+      auto arg = cast<BlockArgument>(v);
+      builder.setInsertionPointToStart(arg.getOwner());
+      auto newType =
+          cast<RankedTensorType>(v.getType()).cloneWithEncoding(layout[v]);
+      mapping.map(v, ConvertLayoutOp::create(builder, convertOp.getLoc(),
+                                             newType, v)
+                         .getResult());
+      continue;
     }
 
     // We expect the leaves of the slice to be Load, DescriptorLoad or
