@@ -5709,6 +5709,16 @@ def test_dot_max_num_imprecise_acc(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, in_type_s
     b = to_triton(B, device=device, dst_type=in_type_str)
     grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N), 1)
     max_num_impressive_acc = low_precision_acc if low_precision_acc <= BLOCK_K else None
+    if not is_interpreter():
+        # Where the 128x256 tile goes through shared memory depends on the target (pipeline stages, or the fp32
+        # accumulator in the epilogue before sm_80); the compiled kernel knows its need.
+        compiled = matmul_kernel.warmup(a, b, C, M, N, K, a.stride(0), a.stride(1), b.stride(0), b.stride(1),
+                                        C.stride(0), C.stride(1), BLOCK_M, BLOCK_N, BLOCK_K, max_num_impressive_acc,
+                                        num_warps=num_warps, num_stages=num_stages, grid=grid)
+        max_shared_mem = triton.runtime.driver.active.utils.get_device_properties(
+            triton.runtime.driver.active.get_current_device())["max_shared_mem"]
+        if compiled.metadata.shared > max_shared_mem:
+            pytest.skip("Skipped due to insufficient shared memory on this GPU.")
     h = matmul_kernel[grid](a, b, C, M, N, K, a.stride(0), a.stride(1), b.stride(0), b.stride(1), C.stride(0),
                             C.stride(1), BLOCK_M, BLOCK_N, BLOCK_K, max_num_impressive_acc, num_warps=num_warps,
                             num_stages=num_stages)
