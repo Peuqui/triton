@@ -218,11 +218,37 @@ void createAsyncCopy(scf::ForOp forOp, tt::LoadOp loadOp, Value alloc,
 // the iteration of the load anyway. V100 fp16 GEMM measured 2-8 % faster that
 // way; Turing keeps the load stage (RTX 8000 4096^3 measured 3 % slower) and
 // the barrier.
-void createRegisterStagedCopy(scf::ForOp forOp, tt::LoadOp loadOp, Value alloc,
+// A dequant between load and dot (pure elementwise ops, each the only user of
+// the previous value and otherwise fed by loop invariants) runs between the
+// register-staged load and its store: the buffer holds the decoded operand, so
+// every element is decoded once per CTA instead of once per MMA fragment that
+// holds it, and the dot reads plain fp16 tiles as in a GEMM.
+SmallVector<Operation *> getRegisterStagedDecode(scf::ForOp forOp,
+                                                 Operation *loadOp) {
+  SmallVector<Operation *> decode;
+  Value value = loadOp->getResult(0);
+  while (value.hasOneUse()) {
+    Operation *user = *value.getUsers().begin();
+    if (user->getNumResults() != 1 || !user->hasTrait<OpTrait::Elementwise>() ||
+        !isPure(user))
+      break;
+    if (llvm::any_of(user->getOperands(), [&](Value operand) {
+          return operand != value && !forOp.isDefinedOutsideOfLoop(operand);
+        }))
+      break;
+    decode.push_back(user);
+    value = user->getResult(0);
+  }
+  return decode;
+}
+
+void createRegisterStagedCopy(scf::ForOp forOp, tt::LoadOp loadOp,
+                              ArrayRef<Operation *> decode, Value alloc,
                               Value insertIdx, Value extractIdx,
                               CoarseSchedule &schedule) {
   OpBuilderForStage builder(loadOp.getLoc(), forOp, schedule);
-  Operation *firstUse = getFirstUseOfPipelinedOp({loadOp}, forOp, schedule);
+  Operation *staged = decode.empty() ? loadOp.getOperation() : decode.back();
+  Operation *firstUse = getFirstUseOfPipelinedOp({staged}, forOp, schedule);
   assert(firstUse && "LoadOp has no users");
   auto [useStage, useCluster] = schedule[firstUse];
   bool volta =
@@ -233,7 +259,7 @@ void createRegisterStagedCopy(scf::ForOp forOp, tt::LoadOp loadOp, Value alloc,
   builder.setInsertionPoint(firstUse);
   builder.setStageCluster({useStage, useCluster});
   auto viewLoad = createSingleBufferView(builder, alloc, extractIdx);
-  replaceUsesWithLocalLoad(builder, loadOp->getResult(0), viewLoad);
+  replaceUsesWithLocalLoad(builder, staged->getResult(0), viewLoad);
 
   auto next = std::next(useCluster);
   auto storeCluster = next == schedule.clusters.end()
@@ -248,10 +274,16 @@ void createRegisterStagedCopy(scf::ForOp forOp, tt::LoadOp loadOp, Value alloc,
   schedule.insert(loadOp, loadStage, issueCluster);
   schedule.insertDepsOfOp(loadOp, loadStage, issueCluster, /*includeArg=*/true,
                           /*insertIfEarlier=*/true);
-  builder.setInsertionPointAfter(loadOp);
+  Operation *beforeStore = loadOp;
+  for (Operation *op : decode) {
+    op->moveAfter(beforeStore);
+    schedule.insert(op, loadStage, storeCluster);
+    beforeStore = op;
+  }
+  builder.setInsertionPointAfter(beforeStore);
   builder.setStageCluster({loadStage, storeCluster});
   Value view = createSingleBufferView(builder, alloc, insertIdx);
-  auto store = ttg::LocalStoreOp::create(builder, loadOp.getResult(), view);
+  auto store = ttg::LocalStoreOp::create(builder, staged->getResult(0), view);
   if (volta)
     store->setAttr(kRegisterStagedStoreAttrName, builder.getUnitAttr());
 }
@@ -332,6 +364,8 @@ struct AsyncLoad {
   SharedEncodingTrait sharedEncoding;
   // Staged through registers into shared memory (no cp.async before sm_80).
   bool registerStaged = false;
+  // Elementwise ops decoding the loaded tile before it is staged.
+  SmallVector<Operation *> decode;
 };
 struct LoadGroupInfo {
   Value insertIdx;
@@ -562,14 +596,18 @@ scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
         // into double-buffered shared memory. At distance 1 (num_stages 2)
         // they stay pipelined in registers, which keeps small tiles (decode
         // GEMMs) at more CTAs per SM.
+        SmallVector<Operation *> decode = getRegisterStagedDecode(forOp, &op);
+        Value staged =
+            decode.empty() ? op.getResult(0) : decode.back()->getResult(0);
         bool incompatible = false;
         auto dotEncoding =
-            getSharedEncIfAllUsersAreDotEnc(op.getResult(0), incompatible);
+            getSharedEncIfAllUsersAreDotEnc(staged, incompatible);
         if (dotEncoding && *dotEncoding) {
           auto &asyncLoad = asyncLoads[&op];
           asyncLoad.stageDiff = stageDiff;
           asyncLoad.sharedEncoding = *dotEncoding;
           asyncLoad.registerStaged = true;
+          asyncLoad.decode = std::move(decode);
         }
       } else if (stageDiff > 1) {
         // Distance-1 loads can in most cases be pipelined in registers without
@@ -593,7 +631,10 @@ scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
     return forOp;
 
   for (auto &[loadOp, asyncLoad] : asyncLoads) {
-    Value alloc = createAlloc(forOp, loadOp, asyncLoad.sharedEncoding,
+    // A decoded operand is buffered in its decoded type
+    Operation *staged =
+        asyncLoad.decode.empty() ? loadOp : asyncLoad.decode.back();
+    Value alloc = createAlloc(forOp, staged, asyncLoad.sharedEncoding,
                               asyncLoad.stageDiff);
     asyncLoad.alloc = alloc;
     loadGroups.insert({asyncLoad.stageDiff, {}});
@@ -673,8 +714,9 @@ scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
     auto [insertIdx, extractIdx, phase, _] = loadGroups[asyncLoad.stageDiff];
     if (auto loadOp = dyn_cast<tt::LoadOp>(op)) {
       if (asyncLoad.registerStaged) {
-        createRegisterStagedCopy(forOp, loadOp, asyncLoad.alloc, insertIdx,
-                                 extractIdx, schedule);
+        createRegisterStagedCopy(forOp, loadOp, asyncLoad.decode,
+                                 asyncLoad.alloc, insertIdx, extractIdx,
+                                 schedule);
       } else {
         createAsyncCopy(forOp, loadOp, asyncLoad.alloc, insertIdx, extractIdx,
                         asyncLoad.contiguity, schedule);
