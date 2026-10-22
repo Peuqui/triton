@@ -29,9 +29,14 @@ using namespace triton;
 SmallVector<unsigned, 3> mmaVersionToInstrShape(int version,
                                                 const ArrayRef<int64_t> &shape,
                                                 Type eltType, int numWarps) {
-  if (version == 1)
+  if (version == 1) {
+    // Volta: the four quadpair 8x8 tiles of a warp. A dot of at most 8 rows
+    // (decode) places them side by side along n, so the rows are shared and
+    // every B element lives in one quadpair; otherwise 2x2.
+    if (shape[0] <= 8 && shape[1] >= 32)
+      return {8, 32};
     return {16, 16};
-  else if (version == 2) {
+  } else if (version == 2) {
     auto rank = shape.size();
     SmallVector<unsigned, 3> ret(rank, 1);
     ret[rank - 1] = 8;

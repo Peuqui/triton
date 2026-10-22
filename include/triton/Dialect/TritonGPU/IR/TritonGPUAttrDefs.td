@@ -177,14 +177,16 @@ When vec=2, elements are swizzled in pairs of 2.  In other words, the element at
         // ---- begin Volta ----
         // A Volta thread reads its four k values (kWidth) as one vector, so
         // the swizzle unit is 4 elements. A half warp, which one 64-bit shared
-        // load serves at a time, reads rows 0-3 and 8-11 of a 16-row MMAv1
-        // tile: the phase has to run over 16 rows, not Ampere's 8, or rows r
-        // and r + 8 share their banks.
+        // load serves at a time, reads rows 0-3 and 8-11 of a 16x16 MMAv1
+        // tile, and B columns 0-3, 8-11, 16-19 and 24-27 of an 8x32 tile: the
+        // phase has to run over the tile's extent in that dimension (Ampere
+        // uses 8), or rows r and r + 8 share their banks.
         if (mmaEnc.isVolta()) {
           int K = getShapePerCTA(CTALayout.getCTASplitNum(), shape)[order[0]];
           int perPhase = std::max<int>(1024 / (typeWidthInBit * K), 1);
           int vec = 4;
-          int mmaStride = 16;
+          int mmaStride =
+              mmaEnc.getInstrShape()[dotOpEnc.getOpIdx() == 0 ? 0 : 1];
           if (needTrans)
             std::swap(vec, mmaStride);
           int rank = order.size();
