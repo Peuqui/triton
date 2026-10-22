@@ -955,12 +955,14 @@ LinearLayout nvidiaMmaTile(MLIRContext *ctx, ArrayRef<unsigned> tileShape,
 // the reverse: in the 8x32 tile every quadpair shares A and holds its own B.
 // The row/col forms take an operand that runs along k in memory (kWidth 4,
 // four k values per thread), the col/row forms one that runs along m or n
-// (kWidth 1), so every thread reads its four values as one vector.
+// (kWidth 1), so every thread reads its four values as one vector. A batched
+// dot puts its batch dimension in front of the tile.
 static LinearLayout voltaMmaTile(MLIRContext *ctx, int opIdx, int kWidth,
                                  ArrayRef<unsigned> instrShape,
                                  ArrayRef<unsigned> repOrder) {
-  auto dims = standardOutDimNames(ctx, 2);
-  bool wide = instrShape[0] == 8;
+  int rank = repOrder.size();
+  auto dims = standardOutDimNames(ctx, rank);
+  bool wide = instrShape[rank - 2] == 8;
   std::vector<int32_t> q2 =
       wide ? std::vector<int32_t>{0, 8} : std::vector<int32_t>{8, 0};
   std::vector<int32_t> q3 =
@@ -988,11 +990,14 @@ static LinearLayout voltaMmaTile(MLIRContext *ctx, int opIdx, int kWidth,
     bases[S("register")] = {{0, 1}, {2, 0}, {0, 4}};
     bases[S("lane")] = {{1, 0}, {0, 2}, q2, q3, {4, 0}};
   }
-  LinearLayout tile(std::move(bases), {dims[0], dims[1]});
+  for (auto &[inDim, vectors] : bases)
+    for (auto &vector : vectors)
+      vector.insert(vector.begin(), rank - 2, 0);
+  LinearLayout tile(std::move(bases), dims);
   // The trivial register layout only fixes the order in which repetitions
   // are added later (repOrder), as in nvidiaMmaTile.
-  LinearLayout ordered =
-      identityStandardND(S("register"), SmallVector<unsigned>(2, 1), repOrder);
+  LinearLayout ordered = identityStandardND(
+      S("register"), SmallVector<unsigned>(rank, 1), repOrder);
   return ordered *
          tile.transposeOuts(llvm::to_vector(ordered.getOutDimNames()));
 }
@@ -1004,7 +1009,6 @@ NvidiaMmaEncodingAttr::toLinearLayout(ArrayRef<int64_t> shape) const {
   assert(rank == getRank());
 
   if (isVolta()) {
-    assert(rank == 2 && "Volta MMA supports rank-2 dots only");
     auto ctaLayout = voltaMmaTile(ctx, /*opIdx=*/2, /*kWidth=*/0,
                                   getInstrShape(), getRepOrder());
     ctaLayout *=
@@ -1044,8 +1048,7 @@ LinearLayout nvidiaDotToLinearLayout(ArrayRef<int64_t> shape,
   MLIRContext *ctx = mma.getContext();
 
   if (mma.isVolta()) {
-    assert(rank == 2 && (kWidth == 4 || kWidth == 1) &&
-           "Volta MMA operands: rank 2, kWidth 4 or 1");
+    assert((kWidth == 4 || kWidth == 1) && "Volta MMA operands: kWidth 4 or 1");
     auto ctaLayout = voltaMmaTile(ctx, dot.getOpIdx(), kWidth,
                                   mma.getInstrShape(), dot.getRepOrder());
     ctaLayout *=

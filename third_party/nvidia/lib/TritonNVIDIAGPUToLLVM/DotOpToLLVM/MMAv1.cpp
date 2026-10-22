@@ -11,9 +11,10 @@ using namespace mlir::triton;
 
 namespace {
 
-using Coord = std::pair<int32_t, int32_t>;
+// (batch, row, col); a 2D dot has batch 0.
+using Coord = std::tuple<int32_t, int32_t, int32_t>;
 
-// (row, col) that register `reg` of lane 0, warp 0 holds in `layout`. Lanes
+// Coordinates that register `reg` of lane 0, warp 0 holds in `layout`. Lanes
 // and warps only add offsets inside an MMA tile or move whole tiles, so the
 // coordinates of lane 0 identify the operand slot of every register.
 Coord registerCoord(const LinearLayout &layout, int reg, MLIRContext *ctx) {
@@ -23,10 +24,12 @@ Coord registerCoord(const LinearLayout &layout, int reg, MLIRContext *ctx) {
   auto kBlock = StringAttr::get(ctx, "block");
   auto out =
       layout.apply({{kRegister, reg}, {kLane, 0}, {kWarp, 0}, {kBlock, 0}});
-  return {out[0].second, out[1].second};
+  if (out.size() == 3)
+    return {out[0].second, out[1].second, out[2].second};
+  return {0, out[0].second, out[1].second};
 }
 
-// Operand values by their (row, col) coordinate for lane 0.
+// Operand values by their (batch, row, col) coordinate for lane 0.
 std::map<Coord, Value> operandByCoord(Value llOperand, RankedTensorType type,
                                       Location loc,
                                       ConversionPatternRewriter &rewriter) {
@@ -43,8 +46,8 @@ std::map<Coord, Value> operandByCoord(Value llOperand, RankedTensorType type,
 // D = A * B + C on Volta tensor cores with mma.sync.m8n8k4 (fp16 operands,
 // fp32 accumulators). Register slots come from the MMAv1 linear layouts
 // (see voltaMmaTile in LinearLayoutConversions.cpp): per warp tile (16x16, or
-// 8x32 for at most 8 rows) each quadpair runs one m8n8k4 per k step of 4, in
-// the row/col form of the operand layouts.
+// 8x32 for at most 8 rows) and batch each quadpair runs one m8n8k4 per k step
+// of 4, in the row/col form of the operand layouts.
 LogicalResult convertMMA884(triton::DotOp op, triton::DotOp::Adaptor adaptor,
                             const LLVMTypeConverter *typeConverter,
                             ConversionPatternRewriter &rewriter) {
@@ -101,22 +104,23 @@ LogicalResult convertMMA884(triton::DotOp op, triton::DotOp::Adaptor adaptor,
   // An operand with fewer rows or columns folds them like the accumulator
   // (rows 2 and 3 of a 2-row A are rows 0 and 1); they only feed results that
   // are dropped.
-  int K = aType.getShape()[1];
-  int aRows = aType.getShape()[0];
-  int bCols = bType.getShape()[1];
+  int rank = aType.getRank();
+  int K = aType.getShape()[rank - 1];
+  int aRows = aType.getShape()[rank - 2];
+  int bCols = bType.getShape()[rank - 1];
   Type retTy =
       LLVM::LLVMStructType::getLiteral(ctx, SmallVector<Type>(8, f32_ty));
   for (int k = 0; k < K; k += 4) {
     for (auto &[index, tile] : tiles) {
       auto &[origin, slots] = tile;
-      auto [row, col] = origin;
+      auto [batch, row, col] = origin;
       auto aAt = [&](int i) {
-        return aValues.at(aRow ? Coord{row, k + i}
-                               : Coord{(row + i) % aRows, k});
+        return aValues.at(aRow ? Coord{batch, row, k + i}
+                               : Coord{batch, (row + i) % aRows, k});
       };
       auto bAt = [&](int i) {
-        return bValues.at(bCol ? Coord{k + i, col}
-                               : Coord{k, (col + i) % bCols});
+        return bValues.at(bCol ? Coord{batch, k + i, col}
+                               : Coord{batch, k, (col + i) % bCols});
       };
       PTXBuilder builder;
       auto *dArgs = builder.newListOperand(8, "=f");

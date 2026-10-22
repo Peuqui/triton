@@ -32,10 +32,14 @@ SmallVector<unsigned, 3> mmaVersionToInstrShape(int version,
   if (version == 1) {
     // Volta: the four quadpair 8x8 tiles of a warp. A dot of at most 8 rows
     // (decode) places them side by side along n, so the rows are shared and
-    // every B element lives in one quadpair; otherwise 2x2.
-    if (shape[0] <= 8 && shape[1] >= 32)
-      return {8, 32};
-    return {16, 16};
+    // every B element lives in one quadpair; otherwise 2x2. A batched dot
+    // adds a leading 1, as on Ampere.
+    auto rank = shape.size();
+    bool wide = shape[rank - 2] <= 8 && shape[rank - 1] >= 32;
+    SmallVector<unsigned, 3> ret(rank, 1);
+    ret[rank - 2] = wide ? 8 : 16;
+    ret[rank - 1] = wide ? 32 : 16;
+    return ret;
   } else if (version == 2) {
     auto rank = shape.size();
     SmallVector<unsigned, 3> ret(rank, 1);
