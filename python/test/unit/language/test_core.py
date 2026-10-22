@@ -3461,8 +3461,8 @@ def test_dot(M, N, K, num_warps, col_a, col_b, epilogue, input_precision, in_dty
             assert re.search(r'tcgen05.mma.cta_group::1.kind::f16', ptx)
         elif capability[0] == 7 and capability[1] == 5:  # Turing
             assert re.search(r'mma.sync.aligned.m\d+n\d+k8(?:.row.col)?.f32.f16.f16', ptx)
-        elif capability[0] == 7 and capability[1] == 0:  # Volta
-            assert 'mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32' in ptx
+        elif capability[0] == 7 and capability[1] == 0:  # Volta: row/col form per operand memory order
+            assert re.search(r'mma.sync.aligned.m8n8k4.(row|col).(row|col).f32.f16.f16.f32', ptx)
         else:
             assert re.search(r'[mma|wgmma.mma_async].sync.aligned.m\d+n\d+k16(?:.row.col)?.f32.f16.f16', ptx)
     elif in_dtype == 'float16' and out_dtype == tl.float16:
