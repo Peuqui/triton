@@ -2,6 +2,7 @@ add_triton_library(TritonNVIDIAGPUToLLVM
     ConvertLayoutOpToLLVM.cpp
     ConvertWarpSpecializeToLLVM.cpp
     MemoryOpToLLVM.cpp
+    DotOpToLLVM/MMAv1.cpp
     DotOpToLLVM/MMAv2.cpp
     DotOpToLLVM/MMAv5.cpp
     DotOpToLLVM/WGMMA.cpp

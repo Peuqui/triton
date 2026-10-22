@@ -2478,9 +2478,13 @@ LogicalResult DotOperandEncodingAttr::verify(
     return emitError() << "ttg.dot_op parent parameter cannot be null";
   }
   if (auto parentAttr = mlir::dyn_cast<NvidiaMmaEncodingAttr>(parent)) {
-    if (kWidth != 0 && !(parentAttr.isAmpere() || parentAttr.isHopper()))
+    if (parentAttr.isVolta() && kWidth != 4)
+      return emitError() << "ttg.dot_op kWidth parameter must be 4 for a "
+                            "Volta MMA parent";
+    if (kWidth != 0 && !(parentAttr.isVolta() || parentAttr.isAmpere() ||
+                         parentAttr.isHopper()))
       return emitError() << "ttg.dot_op kWidth parameter can only be "
-                            "non-zero for Ampere or Hopper MMA parent";
+                            "non-zero for Volta, Ampere or Hopper MMA parent";
     if (kWidth == 0 && (parentAttr.isAmpere() || parentAttr.isHopper()))
       return emitError() << "ttg.dot_op kWidth parameter is mandatory for "
                             "Ampere or Hopper MMA parent";

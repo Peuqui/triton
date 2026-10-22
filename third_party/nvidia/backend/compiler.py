@@ -265,8 +265,9 @@ class CUDABackend(BaseBackend):
         passes.ttgpuir.add_optimize_dot_operands(pm, capability >= 80)
         nvidia.passes.ttnvgpuir.add_optimize_descriptor_encoding(pm)
         passes.ttir.add_loop_aware_cse(pm)
-        # Turing pipelines its loads in registers (no cp.async, see LowerLoops).
-        if capability // 10 in [8, 9] or capability == 75:
+        # Volta and Turing pipeline their loads in registers (no cp.async, see
+        # LowerLoops).
+        if capability // 10 in [7, 8, 9]:
             passes.ttgpuir.add_fuse_nested_loops(pm)
             passes.common.add_canonicalizer(pm)
             passes.ttir.add_triton_licm(pm)

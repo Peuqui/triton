@@ -30,17 +30,20 @@ namespace gpu {
 
 namespace {
 
-// Turing has MMAv2 instructions for fp16 (m16n8k8) and int8 (m8n8k16) only;
-// bf16, tf32 and batched dots have no Turing instruction and stay on FMA.
-static bool turingSupportsMMA(DotOp dotOp) {
+// Volta (MMAv1, m8n8k4) and Turing (MMAv2, m16n8k8 / m8n8k16) have tensor-core
+// instructions for fp16 with fp32 accumulators; Turing also for fp16
+// accumulators and int8. bf16, tf32 and batched dots have no instruction on
+// these cards and stay on FMA.
+static bool sm7xSupportsMMA(DotOp dotOp, int computeCapability) {
   if (dotOp.getType().getRank() != 2)
     return false;
+  bool isTuring = computeCapability == 75;
   Type aElemTy = dotOp.getA().getType().getElementType();
   Type bElemTy = dotOp.getB().getType().getElementType();
   Type dElemTy = dotOp.getType().getElementType();
   if (aElemTy.isF16() && bElemTy.isF16())
-    return dElemTy.isF32() || dElemTy.isF16();
-  if (aElemTy.isInteger(8) && bElemTy.isInteger(8))
+    return dElemTy.isF32() || (isTuring && dElemTy.isF16());
+  if (isTuring && aElemTy.isInteger(8) && bElemTy.isInteger(8))
     return dElemTy.isInteger(32);
   return false;
 }
@@ -86,7 +89,8 @@ static int getMMAVersionSafe(int computeCapability, DotOp op) {
 
 SmallVector<unsigned> warpsPerTileV2(DotOpInterface dotOp,
                                      const ArrayRef<int64_t> shape,
-                                     int numWarps) {
+                                     int numWarps,
+                                     ArrayRef<int64_t> shapePerWarp) {
   auto rank = shape.size();
   // Early exit for batched matmul
   if (rank == 3)
@@ -120,7 +124,6 @@ SmallVector<unsigned> warpsPerTileV2(DotOpInterface dotOp,
   }
 
   assert(rank == 2);
-  SmallVector<int64_t> shapePerWarp = {16, 8};
   SmallVector<int64_t> warps = {1, 1};
   // Compute repM and repN
   SmallVector<int64_t> reps = {ceil(shape[0], shapePerWarp[0]),
@@ -253,8 +256,11 @@ getWarpsPerTile(DotOpInterface dotOp, const ArrayRef<int64_t> shape,
                 int version, int numWarps,
                 const SmallVector<unsigned, 3> &instrShape) {
   switch (version) {
+  case 1:
+    // Volta: a warp covers 16x16 (four 8x8 quadpair tiles)
+    return warpsPerTileV2(dotOp, shape, numWarps, {16, 16});
   case 2:
-    return warpsPerTileV2(dotOp, shape, numWarps);
+    return warpsPerTileV2(dotOp, shape, numWarps, {16, 8});
   case 3:
     return warpsPerTileV3(dotOp, shape, numWarps, instrShape);
   default:
@@ -333,8 +339,8 @@ static MMAEncodingResult createMMAEncodingForDot(DotOpInterface dotOp,
   int numWarps = lookupNumWarps(dotOp);
 
   int versionMinor = computeCapability == 75 ? 1 : 0;
-  // Only MMAv2 and MMAv3 rely on computing instrShape/warpsPerTile here.
-  if (!(versionMajor == 2 || versionMajor == 3)) {
+  // Only MMAv1, MMAv2 and MMAv3 rely on computing instrShape/warpsPerTile here.
+  if (!(versionMajor == 1 || versionMajor == 2 || versionMajor == 3)) {
     return {nullptr, RankedTensorType(), Value(), versionMajor, versionMinor};
   }
 
@@ -385,13 +391,7 @@ public:
                   mlir::PatternRewriter &rewriter) const override {
     if (computeCapability < 70)
       return failure();
-    if (computeCapability < 75) {
-      dotOp.emitRemark()
-          << "Dot op using MMA for compute capability " << computeCapability
-          << " has been deprecated. It falls back to the FMA path.";
-      return failure();
-    }
-    if (computeCapability == 75 && !turingSupportsMMA(dotOp))
+    if (computeCapability < 80 && !sm7xSupportsMMA(dotOp, computeCapability))
       return failure();
     // TODO: Check data-types and SM compatibility
     auto retType = dotOp.getType();

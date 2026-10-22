@@ -14,6 +14,10 @@ LogicalResult convertMMA(triton::DotOp op, triton::DotOp::Adaptor adaptor,
                          ConversionPatternRewriter &rewriter, bool isTuring,
                          bool isHopperF64);
 
+LogicalResult convertMMA884(triton::DotOp op, triton::DotOp::Adaptor adaptor,
+                            const LLVMTypeConverter *typeConverter,
+                            ConversionPatternRewriter &rewriter);
+
 LogicalResult convertMMADotScaled(triton::DotScaledOp op,
                                   triton::DotScaledOp::Adaptor adaptor,
                                   const LLVMTypeConverter *typeConverter,
@@ -62,6 +66,8 @@ struct DotOpConversion : public ConvertOpToLLVMPattern<triton::DotOp> {
     NvidiaMmaEncodingAttr mmaLayout = dyn_cast<NvidiaMmaEncodingAttr>(
         cast<RankedTensorType>(D.getType()).getEncoding());
     if (mmaLayout) {
+      if (mmaLayout.isVolta())
+        return convertMMA884(op, adaptor, getTypeConverter(), rewriter);
       if (mmaLayout.getVersionMajor() == 2) {
         bool isHopperF64 =
             computeCapability == 90 &&

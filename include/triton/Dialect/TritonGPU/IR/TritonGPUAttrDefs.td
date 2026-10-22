@@ -174,6 +174,13 @@ When vec=2, elements are swizzled in pairs of 2.  In other words, the element at
         if(!mmaEnc)
           return get(context, 1, 1, 1, order, CTALayout);
 
+        // ---- begin Volta ----
+        // A Volta thread reads its four k values (kWidth) as one vector; the
+        // Ampere swizzle with kWidth 1 swizzles in units of 4 elements.
+        if (mmaEnc.isVolta()) {
+          return get(context, dotOpEnc.getOpIdx(), 1, shape, order, CTALayout, typeWidthInBit, needTrans);
+        }
+
         // ---- begin Ampere & Hopper ----
         if (mmaEnc.isAmpere() || mmaEnc.isHopper()) {
           return get(context, dotOpEnc.getOpIdx(), dotOpEnc.getKWidth(), shape, order, CTALayout, typeWidthInBit, needTrans);
@@ -1438,6 +1445,9 @@ vecIdx (index of the element in the quad; this is always along the k-dim)
                      "Attribute":$parent,
                      "Type":$eltTy), [{
       NvidiaMmaEncodingAttr parentAttr = mlir::dyn_cast<NvidiaMmaEncodingAttr>(parent);
+      // Volta mma.m8n8k4 takes four consecutive k values per thread
+      if (parentAttr && parentAttr.isVolta())
+        return $_get(context, opIdx, parent, 4);
       if (!parentAttr || (!parentAttr.isAmpere() && !parentAttr.isHopper()))
         return $_get(context, opIdx, parent, 0);
       // For MMAV2 and V3
