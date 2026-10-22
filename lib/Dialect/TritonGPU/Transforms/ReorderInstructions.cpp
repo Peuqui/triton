@@ -28,20 +28,31 @@ namespace gpu {
 #define GEN_PASS_DEF_TRITONGPUREORDERINSTRUCTIONS
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h.inc"
 
-// Before sm_80 a loop-invariant dot operand that fits in this many registers
-// per thread stays in registers instead of being re-read from shared memory in
-// every iteration (measured on Turing: flash attention 1.37x, indexer 1.16x).
-static constexpr unsigned kMaxHoistedDotOperandRegs = 64;
+// Before sm_80 there is no cp.async and shared memory is the bottleneck, so a
+// loop-invariant dot operand is better kept in registers than re-read from
+// shared memory in every iteration -- as long as it fits next to the state the
+// loop carries (accumulators, softmax statistics); beyond this many registers
+// per thread the two together spill.
+static constexpr unsigned kHoistRegisterBudget = 224;
 
-static bool fitsInRegistersBeforeAmpere(Operation *op, bool preAmpere) {
-  if (!preAmpere)
-    return false;
+static unsigned registersPerThread(Type type) {
+  auto tensor = dyn_cast<RankedTensorType>(type);
+  if (!tensor)
+    return 1;
+  unsigned bits = triton::gpu::getTotalElemsPerThread(tensor) *
+                  tensor.getElementTypeBitWidth();
+  return (bits + 31) / 32;
+}
+
+static bool staysInRegistersBeforeAmpere(Operation *op, scf::ForOp loop) {
   auto type = dyn_cast<RankedTensorType>(op->getResult(0).getType());
   if (!type || !isa<triton::gpu::DotOperandEncodingAttr>(type.getEncoding()))
     return false;
-  unsigned bits = triton::gpu::getTotalElemsPerThread(type) *
-                  type.getElementTypeBitWidth();
-  return bits <= kMaxHoistedDotOperandRegs * 32;
+  unsigned operand = registersPerThread(type);
+  unsigned carried = 0;
+  for (Value arg : loop.getRegionIterArgs())
+    carried += registersPerThread(arg.getType());
+  return operand + carried <= kHoistRegisterBudget;
 }
 
 static bool willIncreaseRegisterPressure(Operation *op) {
@@ -127,14 +138,14 @@ public:
     m.walk([&](Operation *op) {
       if (!willIncreaseRegisterPressure(op))
         return;
-      if (fitsInRegistersBeforeAmpere(op, preAmpere))
-        return;
       auto user_begin = op->user_begin();
       auto user_end = op->user_end();
       if (std::distance(user_begin, user_end) != 1)
         return;
-      if (user_begin->getParentOfType<scf::ForOp>() ==
-          op->getParentOfType<scf::ForOp>())
+      auto userLoop = user_begin->getParentOfType<scf::ForOp>();
+      if (userLoop == op->getParentOfType<scf::ForOp>())
+        return;
+      if (preAmpere && userLoop && staysInRegistersBeforeAmpere(op, userLoop))
         return;
       opToMove.insert({op, *user_begin});
     });
