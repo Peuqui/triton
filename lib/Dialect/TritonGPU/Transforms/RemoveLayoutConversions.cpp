@@ -1341,11 +1341,13 @@ void LayoutRematerialization::hoistConvertDotOperand(
   auto dotEnc = dyn_cast<DotOperandEncodingAttr>(targetType.getEncoding());
   auto mmaParent =
       dotEnc ? dyn_cast<NvidiaMmaEncodingAttr>(dotEnc.getParent()) : nullptr;
-  if (mmaParent && mmaParent.isVolta() &&
+  bool volta = mmaParent && mmaParent.isVolta();
+  if (volta &&
       toLinearLayout(targetType)
               .getFreeVariableMasks()
               .lookup(StringAttr::get(convertOp.getContext(), "lane")) != 0)
     return;
+  bool decodeTile = volta && mmaParent.getInstrShape().back() == 32;
 
   // Before sm_80 the pipeliner prefetches the next tile into registers: the
   // load becomes a loop-carried value whose yield is the load. Converting that
@@ -1365,9 +1367,47 @@ void LayoutRematerialization::hoistConvertDotOperand(
     return yielded.getDefiningOp<LoadOp>() != nullptr;
   };
 
+  // In Volta's 8x32 decode tile B (the weight) lives in one thread per element
+  // and loads directly in the dot-operand layout, as the hand-written decode
+  // kernels load their weights: no shared-memory round trip and no barrier per
+  // k step. The warps of this tile run along n, so no other warp needs the
+  // tile. (A, held by all four quadpairs, measured slower loaded directly: V100
+  // W8A16 decode 1.17 -> 1.33x the hand kernel.) The operand form follows the
+  // memory order (AccelerateMatmul), so every thread reads at least four
+  // consecutive elements, more with the k repetitions. Only loads whose
+  // addresses are computed in place (ranges, splats, broadcasts, arithmetic)
+  // qualify; a loop-carried pointer keeps the conversion after the load.
+  SetVector<Value> innerSlice;
+  auto addDirectLoad = [&](LoadOp load, Attribute encoding) -> bool {
+    SetVector<Value> loadSlice;
+    DenseMap<Value, Attribute> loadLayout;
+    for (OpOperand &operand : load->getOpOperands()) {
+      if (!isa<RankedTensorType>(operand.get().getType()))
+        continue;
+      if (failed(getConvertBackwardSlice(operand, encoding, loadSlice,
+                                         loadLayout, nullptr)))
+        return false;
+    }
+    for (Value value : loadSlice) {
+      Operation *op = value.getDefiningOp();
+      if (!op || !(noDataMovement(op) ||
+                   isa<MakeRangeOp, SplatOp, AddPtrOp, arith::ConstantOp>(op)))
+        return false;
+    }
+    for (Value value : loadSlice) {
+      Attribute &existing = layout[value];
+      if (existing && existing != loadLayout[value])
+        return false;
+      existing = loadLayout[value];
+    }
+    innerSlice.insert(loadSlice.begin(), loadSlice.end());
+    innerSlice.insert(load.getResult());
+    return true;
+  };
+  bool directLoads = decodeTile;
+
   IRMapping mapping;
   OpBuilder builder(convertOp.getContext());
-  SetVector<Value> innerSlice;
   for (Value v : slice) {
     if (!v.getDefiningOp()) {
       if (!registerPipelinedLoad(v)) {
@@ -1401,6 +1441,9 @@ void LayoutRematerialization::hoistConvertDotOperand(
       }
     }
     Operation *loadOp = v.getDefiningOp();
+    if (auto load = dyn_cast<LoadOp>(loadOp);
+        directLoads && load && addDirectLoad(load, layout[v]))
+      continue;
     builder.setInsertionPointAfter(loadOp);
     auto type = dyn_cast<RankedTensorType>(loadOp->getResult(0).getType());
     if (!type)
