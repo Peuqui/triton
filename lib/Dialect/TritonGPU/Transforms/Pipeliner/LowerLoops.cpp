@@ -443,11 +443,21 @@ bool loadRequiresAdditionalBuffer(Operation *loadOp) {
   return false;
 }
 
+bool targetHasAsyncCopy(ModuleOp module) {
+  auto target = module->getAttrOfType<StringAttr>(ttg::AttrTargetName);
+  if (!target || !target.strref().starts_with("cuda:"))
+    return true;
+  return getNVIDIAComputeCapability(module) >= 80;
+}
+
 scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
                       triton::ModuleAxisInfoAnalysis &axisInfoAnalysis) {
   llvm::MapVector<Operation *, AsyncLoad> asyncLoads;
   llvm::MapVector<int, LoadGroupInfo> loadGroups;
   llvm::SmallVector<Operation *> scalarLoads;
+  // Without cp.async (NVIDIA before sm_80) loads are pipelined in registers.
+  const bool asyncCopyAvailable =
+      targetHasAsyncCopy(forOp->getParentOfType<ModuleOp>());
   // Only visit the top level ops, we do not support pipelining conditional
   // loads for now
   for (auto &op : forOp.getBody()->without_terminator()) {
@@ -462,7 +472,8 @@ scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
       bool canUseAsyncCp = false;
       int contiguity = 1;
       if (!isa<RankedTensorType>(op.getResultTypes()[0])) {
-        canUseAsyncCp = op.getResultTypes()[0].getIntOrFloatBitWidth() >= 32;
+        canUseAsyncCp = asyncCopyAvailable &&
+                        op.getResultTypes()[0].getIntOrFloatBitWidth() >= 32;
         sharedEncoding = ttg::SwizzledSharedEncodingAttr::get(
             forOp.getContext(), 1, 1, 1, {0},
             ttg::CTAEncodingAttr::getDefault(forOp.getContext(), 1));
@@ -474,7 +485,7 @@ scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
         // Do not create async loads for small loads (cp.async requires at least
         // 4 bytes)
         canUseAsyncCp =
-            isa<tt::LoadOp>(op) &&
+            asyncCopyAvailable && isa<tt::LoadOp>(op) &&
             canBeConvertedToAsyncLoad(cast<tt::LoadOp>(op), axisInfoAnalysis);
         int copyVecBytes = getCopyVecBytes(
             cast<RankedTensorType>(op.getResultTypes()[0]), sharedEncoding);
