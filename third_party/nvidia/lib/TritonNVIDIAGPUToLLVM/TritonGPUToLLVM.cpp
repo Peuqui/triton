@@ -17,6 +17,7 @@
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 
 #include "Allocation.h"
@@ -86,7 +87,13 @@ struct ConvertTritonGPUToLLVM
     ModuleAllocation allocation(
         mod, mlir::triton::nvidia_gpu::getNvidiaAllocationAnalysisScratchSizeFn(
                  targetInfo));
-    ModuleMembarAnalysis membarPass(&allocation);
+    // Before sm_80 dot operands go through register-staged shared buffers;
+    // where the pipeliner marks the store (Volta), the dot's reads and the
+    // store of the next tile within an iteration need no barrier between them.
+    ModuleMembarAnalysis membarPass(
+        &allocation, computeCapability < 80
+                         ? MembarFilterFn(NVIDIA::canSkipRegisterStagedBarSync)
+                         : nullptr);
     membarPass.run();
 
     mlir::LowerToLLVMOptions option(context);
@@ -242,7 +249,38 @@ createConvertTritonGPUToLLVMPass(int32_t computeCapability,
                                                   ptxVersion);
 }
 
+// The allocation a shared-memory view is cut from (through buffer indices and
+// subslices).
+static Value baseAllocation(Value memDesc) {
+  while (Operation *def = memDesc.getDefiningOp()) {
+    if (auto index = dyn_cast<triton::gpu::MemDescIndexOp>(def))
+      memDesc = index.getSrc();
+    else if (auto subslice = dyn_cast<triton::gpu::MemDescSubsliceOp>(def))
+      memDesc = subslice.getSrc();
+    else
+      break;
+  }
+  return memDesc;
+}
+
+bool NVIDIA::canSkipRegisterStagedBarSync(Operation *before, Operation *after) {
+  // Register-staged double buffering before sm_80: the store of the next tile
+  // writes the other buffer of the ring the dot reads in this iteration. The
+  // buffer it writes was last read one iteration earlier, and the barrier that
+  // orders the previous store before this iteration's reads already separates
+  // those reads from this store. So the read-then-write pair within an
+  // iteration needs no barrier of its own.
+  auto store = dyn_cast<triton::gpu::LocalStoreOp>(after);
+  auto load = dyn_cast<triton::gpu::LocalLoadOp>(before);
+  if (!store || !load || !store->hasAttr(kRegisterStagedStoreAttrName))
+    return false;
+  Value ring = baseAllocation(store.getDst());
+  return ring.getDefiningOp<triton::gpu::LocalAllocOp>() &&
+         baseAllocation(load.getSrc()) == ring;
+}
+
 bool NVIDIA::canSkipBarSync(Operation *before, Operation *after) {
+
   // Multiple init barriers on the same allocation would usually not happen but
   // that allows us to avoid barriers between multiple subslice of an array of
   // mbarriers. This is still correct even if the inits happen on the same

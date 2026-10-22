@@ -206,19 +206,28 @@ void createAsyncCopy(scf::ForOp forOp, tt::LoadOp loadOp, Value alloc,
 }
 
 // Without cp.async (NVIDIA before sm_80) a dot operand load is staged through
-// registers: the global load is issued first in the iteration, the dot of the
-// current tile reads its shared buffer, and the loaded tile is written to its
-// own buffer behind that dot (a cluster of its own). With the stage distance
-// as buffer count this is the double-buffered shared memory of the Volta/Turing
-// CUTLASS GEMMs: the shared stores and the load latency overlap the math.
+// registers: the global load of the next tile is issued first in the
+// iteration, the dot of the current tile reads its shared buffer, and the
+// loaded tile is written to its own buffer behind that dot (a cluster of its
+// own). This is the double-buffered shared memory of the Volta/Turing CUTLASS
+// GEMMs: the shared stores and the load latency overlap the math.
+// On Volta load and store sit one stage before the use, so the store always
+// writes the other buffer than the one the dot reads in the same iteration and
+// the barrier between them can go (canSkipRegisterStagedBarSync); issued
+// earlier they would cover no more latency, as the store needs the data in
+// the iteration of the load anyway. V100 fp16 GEMM measured 2-8 % faster that
+// way; Turing keeps the load stage (RTX 8000 4096^3 measured 3 % slower) and
+// the barrier.
 void createRegisterStagedCopy(scf::ForOp forOp, tt::LoadOp loadOp, Value alloc,
                               Value insertIdx, Value extractIdx,
                               CoarseSchedule &schedule) {
   OpBuilderForStage builder(loadOp.getLoc(), forOp, schedule);
   Operation *firstUse = getFirstUseOfPipelinedOp({loadOp}, forOp, schedule);
   assert(firstUse && "LoadOp has no users");
-  auto [loadStage, loadCluster] = schedule[loadOp];
   auto [useStage, useCluster] = schedule[firstUse];
+  bool volta =
+      getNVIDIAComputeCapability(forOp->getParentOfType<ModuleOp>()) < 75;
+  int loadStage = volta ? useStage - 1 : schedule[loadOp].first;
 
   OpBuilder::InsertionGuard guard(builder);
   builder.setInsertionPoint(firstUse);
@@ -242,7 +251,9 @@ void createRegisterStagedCopy(scf::ForOp forOp, tt::LoadOp loadOp, Value alloc,
   builder.setInsertionPointAfter(loadOp);
   builder.setStageCluster({loadStage, storeCluster});
   Value view = createSingleBufferView(builder, alloc, insertIdx);
-  ttg::LocalStoreOp::create(builder, loadOp.getResult(), view);
+  auto store = ttg::LocalStoreOp::create(builder, loadOp.getResult(), view);
+  if (volta)
+    store->setAttr(kRegisterStagedStoreAttrName, builder.getUnitAttr());
 }
 
 void createTMAAsyncCopy(

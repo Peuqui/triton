@@ -19,6 +19,9 @@ static const char *kWarpSpecializeAttrName = "tt.warp_specialize";
 static const char *kLoopStageAttrName = "loop.stage";
 static const char *kLoopClusterAttrName = "loop.cluster";
 static const char *kScheduledMaxStageAttrName = "tt.scheduled_max_stage";
+// Marks the local_store of a dot operand staged through registers into a ring
+// of shared buffers before sm_80 (createRegisterStagedCopy).
+static const char *kRegisterStagedStoreAttrName = "ttg.register_staged_store";
 class CoarseSchedule;
 class ModuleAxisInfoAnalysis;
 //===----------------------------------------------------------------------===//
