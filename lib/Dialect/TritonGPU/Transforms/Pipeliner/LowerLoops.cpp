@@ -443,13 +443,6 @@ bool loadRequiresAdditionalBuffer(Operation *loadOp) {
   return false;
 }
 
-bool targetHasAsyncCopy(ModuleOp module) {
-  auto target = module->getAttrOfType<StringAttr>(ttg::AttrTargetName);
-  if (!target || !target.strref().starts_with("cuda:"))
-    return true;
-  return getNVIDIAComputeCapability(module) >= 80;
-}
-
 scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
                       triton::ModuleAxisInfoAnalysis &axisInfoAnalysis) {
   llvm::MapVector<Operation *, AsyncLoad> asyncLoads;
@@ -457,7 +450,7 @@ scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
   llvm::SmallVector<Operation *> scalarLoads;
   // Without cp.async (NVIDIA before sm_80) loads are pipelined in registers.
   const bool asyncCopyAvailable =
-      targetHasAsyncCopy(forOp->getParentOfType<ModuleOp>());
+      !isPreAmpereNvidia(forOp->getParentOfType<ModuleOp>());
   // Only visit the top level ops, we do not support pipelining conditional
   // loads for now
   for (auto &op : forOp.getBody()->without_terminator()) {

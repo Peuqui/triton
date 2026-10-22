@@ -1063,6 +1063,12 @@ int getNVIDIAComputeCapability(Operation *module) {
   return computeCapability;
 }
 
+bool isPreAmpereNvidia(Operation *module) {
+  auto target = module->getAttrOfType<StringAttr>(triton::gpu::AttrTargetName);
+  return target && target.strref().starts_with("cuda:") &&
+         getNVIDIAComputeCapability(module) < 80;
+}
+
 std::optional<StringRef> getAMDArch(Operation *module) {
   StringAttr targetAttr =
       module->getAttrOfType<StringAttr>(triton::gpu::AttrTargetName);

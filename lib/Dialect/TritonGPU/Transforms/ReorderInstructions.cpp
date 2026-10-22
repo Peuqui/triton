@@ -28,6 +28,22 @@ namespace gpu {
 #define GEN_PASS_DEF_TRITONGPUREORDERINSTRUCTIONS
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h.inc"
 
+// Before sm_80 a loop-invariant dot operand that fits in this many registers
+// per thread stays in registers instead of being re-read from shared memory in
+// every iteration (measured on Turing: flash attention 1.37x, indexer 1.16x).
+static constexpr unsigned kMaxHoistedDotOperandRegs = 64;
+
+static bool fitsInRegistersBeforeAmpere(Operation *op, bool preAmpere) {
+  if (!preAmpere)
+    return false;
+  auto type = dyn_cast<RankedTensorType>(op->getResult(0).getType());
+  if (!type || !isa<triton::gpu::DotOperandEncodingAttr>(type.getEncoding()))
+    return false;
+  unsigned bits = triton::gpu::getTotalElemsPerThread(type) *
+                  type.getElementTypeBitWidth();
+  return bits <= kMaxHoistedDotOperandRegs * 32;
+}
+
 static bool willIncreaseRegisterPressure(Operation *op) {
   if (isa<triton::gpu::LocalLoadOp>(op))
     return true;
@@ -107,8 +123,11 @@ public:
     auto moveAfter = [](Operation *lhs, Operation *rhs) {
       lhs->moveAfter(rhs);
     };
+    bool preAmpere = isPreAmpereNvidia(m);
     m.walk([&](Operation *op) {
       if (!willIncreaseRegisterPressure(op))
+        return;
+      if (fitsInRegistersBeforeAmpere(op, preAmpere))
         return;
       auto user_begin = op->user_begin();
       auto user_end = op->user_end();

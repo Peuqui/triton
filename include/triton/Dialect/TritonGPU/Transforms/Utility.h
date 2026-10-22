@@ -206,6 +206,11 @@ bool isPureUnaryInlineAsm(Operation *op);
 // read the compute capability from the module attributes
 int getNVIDIAComputeCapability(Operation *module);
 
+// NVIDIA targets before sm_80 have no cp.async: loads cannot be copied to
+// shared memory asynchronously, and shared memory bandwidth is the scarce
+// resource (Turing has half of Volta's per SM).
+bool isPreAmpereNvidia(Operation *module);
+
 // Read the amd target from the module attributes
 std::optional<StringRef> getAMDArch(Operation *module);
 
