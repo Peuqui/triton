@@ -30,6 +30,21 @@ namespace gpu {
 
 namespace {
 
+// Turing has MMAv2 instructions for fp16 (m16n8k8) and int8 (m8n8k16) only;
+// bf16, tf32 and batched dots have no Turing instruction and stay on FMA.
+static bool turingSupportsMMA(DotOp dotOp) {
+  if (dotOp.getType().getRank() != 2)
+    return false;
+  Type aElemTy = dotOp.getA().getType().getElementType();
+  Type bElemTy = dotOp.getB().getType().getElementType();
+  Type dElemTy = dotOp.getType().getElementType();
+  if (aElemTy.isF16() && bElemTy.isF16())
+    return dElemTy.isF32() || dElemTy.isF16();
+  if (aElemTy.isInteger(8) && bElemTy.isInteger(8))
+    return dElemTy.isInteger(32);
+  return false;
+}
+
 // Get the highest version supported for the hardware and the dot.
 static int getMMAVersionSafe(int computeCapability, DotOp op) {
   // List supported mma version in order of preference.
@@ -370,12 +385,14 @@ public:
                   mlir::PatternRewriter &rewriter) const override {
     if (computeCapability < 70)
       return failure();
-    if (computeCapability < 80) {
+    if (computeCapability < 75) {
       dotOp.emitRemark()
           << "Dot op using MMA for compute capability " << computeCapability
           << " has been deprecated. It falls back to the FMA path.";
       return failure();
     }
+    if (computeCapability == 75 && !turingSupportsMMA(dotOp))
+      return failure();
     // TODO: Check data-types and SM compatibility
     auto retType = dotOp.getType();
     if (!retType.getEncoding() ||
