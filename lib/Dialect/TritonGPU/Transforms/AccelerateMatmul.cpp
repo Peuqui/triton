@@ -32,12 +32,13 @@ namespace {
 
 // Volta (MMAv1, m8n8k4) and Turing (MMAv2, m16n8k8 / m8n8k16) have tensor-core
 // instructions for fp16 with fp32 accumulators; Turing also for fp16
-// accumulators and int8. bf16, tf32 and batched dots have no instruction on
-// these cards and stay on FMA.
+// accumulators and int8. bf16 and tf32 have no instruction on these cards and
+// stay on FMA. Turing runs batched (3D) dots through MMAv2's batch dimension;
+// Volta's MMAv1 layout is two-dimensional.
 static bool sm7xSupportsMMA(DotOp dotOp, int computeCapability) {
-  if (dotOp.getType().getRank() != 2)
-    return false;
   bool isTuring = computeCapability == 75;
+  if (dotOp.getType().getRank() != 2 && !isTuring)
+    return false;
   Type aElemTy = dotOp.getA().getType().getElementType();
   Type bElemTy = dotOp.getB().getType().getElementType();
   Type dElemTy = dotOp.getType().getElementType();
