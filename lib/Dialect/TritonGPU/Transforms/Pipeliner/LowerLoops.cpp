@@ -205,6 +205,46 @@ void createAsyncCopy(scf::ForOp forOp, tt::LoadOp loadOp, Value alloc,
   loadOp->erase();
 }
 
+// Without cp.async (NVIDIA before sm_80) a dot operand load is staged through
+// registers: the global load is issued first in the iteration, the dot of the
+// current tile reads its shared buffer, and the loaded tile is written to its
+// own buffer behind that dot (a cluster of its own). With the stage distance
+// as buffer count this is the double-buffered shared memory of the Volta/Turing
+// CUTLASS GEMMs: the shared stores and the load latency overlap the math.
+void createRegisterStagedCopy(scf::ForOp forOp, tt::LoadOp loadOp, Value alloc,
+                              Value insertIdx, Value extractIdx,
+                              CoarseSchedule &schedule) {
+  OpBuilderForStage builder(loadOp.getLoc(), forOp, schedule);
+  Operation *firstUse = getFirstUseOfPipelinedOp({loadOp}, forOp, schedule);
+  assert(firstUse && "LoadOp has no users");
+  auto [loadStage, loadCluster] = schedule[loadOp];
+  auto [useStage, useCluster] = schedule[firstUse];
+
+  OpBuilder::InsertionGuard guard(builder);
+  builder.setInsertionPoint(firstUse);
+  builder.setStageCluster({useStage, useCluster});
+  auto viewLoad = createSingleBufferView(builder, alloc, extractIdx);
+  replaceUsesWithLocalLoad(builder, loadOp->getResult(0), viewLoad);
+
+  auto next = std::next(useCluster);
+  auto storeCluster = next == schedule.clusters.end()
+                          ? schedule.clusters.newAtBack()
+                          : schedule.clusters.newBefore(next);
+  // Issue the global load first in the iteration, so the whole dot of the
+  // current tile covers its latency before the store needs the registers. Its
+  // dependencies come along, including the loop-carried pointer increment:
+  // left in a later stage it would follow the load in the iteration, and the
+  // expander would reject the schedule (and not pipeline the loop at all).
+  auto issueCluster = schedule.clusters.newAtFront();
+  schedule.insert(loadOp, loadStage, issueCluster);
+  schedule.insertDepsOfOp(loadOp, loadStage, issueCluster, /*includeArg=*/true,
+                          /*insertIfEarlier=*/true);
+  builder.setInsertionPointAfter(loadOp);
+  builder.setStageCluster({loadStage, storeCluster});
+  Value view = createSingleBufferView(builder, alloc, insertIdx);
+  ttg::LocalStoreOp::create(builder, loadOp.getResult(), view);
+}
+
 void createTMAAsyncCopy(
     scf::ForOp forOp, Operation *loadOp, Value desc, Value alloc,
     Value insertIdx, Value extractIdx, Value barrier, Operation *waitOp,
@@ -279,6 +319,8 @@ struct AsyncLoad {
   Value barrier;
   Operation *waitOp;
   SharedEncodingTrait sharedEncoding;
+  // Staged through registers into shared memory (no cp.async before sm_80).
+  bool registerStaged = false;
 };
 struct LoadGroupInfo {
   Value insertIdx;
@@ -503,6 +545,21 @@ scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
         asyncLoad.stageDiff = stageDiff;
         asyncLoad.contiguity = contiguity;
         asyncLoad.sharedEncoding = sharedEncoding;
+      } else if (!asyncCopyAvailable && stageDiff >= 2 && isa<tt::LoadOp>(op) &&
+                 isa<RankedTensorType>(op.getResultTypes()[0])) {
+        // num_stages >= 3 before sm_80: stage dot operands through registers
+        // into double-buffered shared memory. At distance 1 (num_stages 2)
+        // they stay pipelined in registers, which keeps small tiles (decode
+        // GEMMs) at more CTAs per SM.
+        bool incompatible = false;
+        auto dotEncoding =
+            getSharedEncIfAllUsersAreDotEnc(op.getResult(0), incompatible);
+        if (dotEncoding && *dotEncoding) {
+          auto &asyncLoad = asyncLoads[&op];
+          asyncLoad.stageDiff = stageDiff;
+          asyncLoad.sharedEncoding = *dotEncoding;
+          asyncLoad.registerStaged = true;
+        }
       } else if (stageDiff > 1) {
         // Distance-1 loads can in most cases be pipelined in registers without
         // any performance degradation, as the schedule will usually reorder the
@@ -604,9 +661,14 @@ scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
   for (auto [op, asyncLoad] : asyncLoads) {
     auto [insertIdx, extractIdx, phase, _] = loadGroups[asyncLoad.stageDiff];
     if (auto loadOp = dyn_cast<tt::LoadOp>(op)) {
-      createAsyncCopy(forOp, loadOp, asyncLoad.alloc, insertIdx, extractIdx,
-                      asyncLoad.contiguity, schedule);
-      hasAsyncLoads = true;
+      if (asyncLoad.registerStaged) {
+        createRegisterStagedCopy(forOp, loadOp, asyncLoad.alloc, insertIdx,
+                                 extractIdx, schedule);
+      } else {
+        createAsyncCopy(forOp, loadOp, asyncLoad.alloc, insertIdx, extractIdx,
+                        asyncLoad.contiguity, schedule);
+        hasAsyncLoads = true;
+      }
     } else if (auto loadOp = dyn_cast<tt::DescriptorLoadOp>(op)) {
       createTMAAsyncLoad(forOp, loadOp, asyncLoad.alloc, insertIdx, extractIdx,
                          asyncLoad.barrier, asyncLoad.waitOp, schedule);
