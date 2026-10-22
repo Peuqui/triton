@@ -187,6 +187,10 @@ LogicalResult Prefetcher::initialize() {
   auto getPrefetchSrc = [](Value v) -> SmallVector<Value> {
     // walk back to conversion
     Operation *op = v.getDefiningOp();
+    // An operand loaded straight into registers and carried by the loop (pre-
+    // sm80 register pipelining) does not come from shared memory.
+    if (!op)
+      return {};
     bool foundConvertFromShared = false;
     SmallVector<Value> rets;
     rets.push_back(op->getResult(0));
