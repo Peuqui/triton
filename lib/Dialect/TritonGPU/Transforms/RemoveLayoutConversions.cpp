@@ -1342,12 +1342,24 @@ void LayoutRematerialization::hoistConvertDotOperand(
   auto mmaParent =
       dotEnc ? dyn_cast<NvidiaMmaEncodingAttr>(dotEnc.getParent()) : nullptr;
   bool volta = mmaParent && mmaParent.isVolta();
-  if (volta &&
-      toLinearLayout(targetType)
-              .getFreeVariableMasks()
-              .lookup(StringAttr::get(convertOp.getContext(), "lane")) != 0)
-    return;
-  bool decodeTile = volta && mmaParent.getInstrShape().back() == 32;
+  bool warpShared = false;
+  if (volta) {
+    auto freeMasks = toLinearLayout(targetType).getFreeVariableMasks();
+    MLIRContext *ctx = convertOp.getContext();
+    if (freeMasks.lookup(StringAttr::get(ctx, "lane")) != 0)
+      return;
+    warpShared = freeMasks.lookup(StringAttr::get(ctx, "warp")) != 0;
+  }
+  // In Volta's 8x32 decode tile an operand held by one thread per element and
+  // needed by no other warp (B, the weight, with the warps along n or along a
+  // batch of K splits) loads directly in the dot-operand layout, as the
+  // hand-written decode kernels load their weights: no shared-memory round
+  // trip and no barrier per k step. A is held by all four quadpairs and stays
+  // on the shared-memory path: loaded directly it measured slower on V100 W8A16
+  // decode, shared by the warps of a 2D dot (1.17 -> 1.33x the hand kernel) as
+  // well as per warp in split-K inside the block (1.16 -> 1.39x).
+  bool directLoads =
+      volta && !warpShared && mmaParent.getInstrShape().back() == 32;
 
   // Before sm_80 the pipeliner prefetches the next tile into registers: the
   // load becomes a loop-carried value whose yield is the load. Converting that
@@ -1367,16 +1379,11 @@ void LayoutRematerialization::hoistConvertDotOperand(
     return yielded.getDefiningOp<LoadOp>() != nullptr;
   };
 
-  // In Volta's 8x32 decode tile B (the weight) lives in one thread per element
-  // and loads directly in the dot-operand layout, as the hand-written decode
-  // kernels load their weights: no shared-memory round trip and no barrier per
-  // k step. The warps of this tile run along n, so no other warp needs the
-  // tile. (A, held by all four quadpairs, measured slower loaded directly: V100
-  // W8A16 decode 1.17 -> 1.33x the hand kernel.) The operand form follows the
-  // memory order (AccelerateMatmul), so every thread reads at least four
-  // consecutive elements, more with the k repetitions. Only loads whose
-  // addresses are computed in place (ranges, splats, broadcasts, arithmetic)
-  // qualify; a loop-carried pointer keeps the conversion after the load.
+  // Direct loads (directLoads above): the operand form follows the memory
+  // order (AccelerateMatmul), so every thread reads at least four consecutive
+  // elements, more with the k repetitions. Only loads whose addresses are
+  // computed in place (ranges, splats, broadcasts, arithmetic) qualify; a
+  // loop-carried pointer keeps the conversion after the load.
   SetVector<Value> innerSlice;
   auto addDirectLoad = [&](LoadOp load, Attribute encoding) -> bool {
     SetVector<Value> loadSlice;
@@ -1404,7 +1411,6 @@ void LayoutRematerialization::hoistConvertDotOperand(
     innerSlice.insert(load.getResult());
     return true;
   };
-  bool directLoads = decodeTile;
 
   IRMapping mapping;
   OpBuilder builder(convertOp.getContext());
