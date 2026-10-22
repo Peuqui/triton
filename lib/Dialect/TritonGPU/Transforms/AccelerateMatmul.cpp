@@ -372,6 +372,24 @@ static Value convertDotOperandForMMA(Value v, int opIdx, int bitwidth,
   auto vType = cast<RankedTensorType>(v.getType());
   auto newVEncoding = DotOperandEncodingAttr::get(
       v.getContext(), opIdx, newRetType.getEncoding(), minType);
+  // Volta's m8n8k4 also takes an operand that runs along m (A) or n (B) in
+  // memory: each thread then holds four consecutive m or n values (kWidth 1)
+  // and reads them as one vector, instead of gathering four k values element
+  // by element. The memory order is the one the operand will have in shared
+  // memory: getOrderForMemory of the tensor behind the layout conversions, as
+  // ReduceDataDuplication picks it. The order of elements within a thread
+  // (getOrder) is not: an operand computed in registers, e.g. the P of an
+  // attention loop, repeats its tile along m and would read as m-contiguous.
+  auto mma = cast<NvidiaMmaEncodingAttr>(newRetType.getEncoding());
+  if (mma.isVolta()) {
+    Value source = v;
+    while (auto cvt = source.getDefiningOp<ConvertLayoutOp>())
+      source = cvt.getSrc();
+    unsigned kDim = opIdx == 0 ? 1 : 0;
+    if (getOrderForMemory(cast<RankedTensorType>(source.getType()))[0] != kDim)
+      newVEncoding = DotOperandEncodingAttr::get(v.getContext(), opIdx, mma,
+                                                 /*kWidth=*/1);
+  }
   auto newVType = vType.cloneWithEncoding(newVEncoding);
   return ConvertLayoutOp::create(rewriter, v.getLoc(), newVType, v);
 }

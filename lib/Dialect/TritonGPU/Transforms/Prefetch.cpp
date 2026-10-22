@@ -72,7 +72,7 @@ class Prefetcher {
   LogicalResult isForOpOperand(Value v);
 
   Value generatePrefetch(Value v, unsigned opIdx, bool isPrologue,
-                         Attribute dotEncoding, OpBuilder &builder,
+                         Attribute operandEncoding, OpBuilder &builder,
                          std::optional<int64_t> offsetK = std::nullopt,
                          std::optional<int64_t> shapeK = std::nullopt);
 
@@ -115,7 +115,8 @@ void Prefetcher::cloneElementwiseOps(Value &ret, const SmallVector<Value> &vals,
 }
 
 Value Prefetcher::generatePrefetch(Value v, unsigned opIdx, bool isPrologue,
-                                   Attribute dotEncoding, OpBuilder &builder,
+                                   Attribute operandEncoding,
+                                   OpBuilder &builder,
                                    std::optional<int64_t> offsetK,
                                    std::optional<int64_t> shapeK) {
   // opIdx: 0 => a, 1 => b
@@ -143,11 +144,11 @@ Value Prefetcher::generatePrefetch(Value v, unsigned opIdx, bool isPrologue,
           type.getMutableMemory(), type.getAllocShape()),
       v, offset);
 
-  auto dotOperandEnc = triton::gpu::DotOperandEncodingAttr::get(
-      builder.getContext(), opIdx, dotEncoding, prefetchWidth / 8);
+  // The slice keeps the operand's layout (its kWidth may differ between A and
+  // B on Volta).
   Value prefetchSlice = triton::gpu::LocalLoadOp::create(
       builder, v.getLoc(),
-      RankedTensorType::get(shape, elementType, dotOperandEnc), newSmem);
+      RankedTensorType::get(shape, elementType, operandEncoding), newSmem);
 
   return prefetchSlice;
 }
@@ -236,13 +237,19 @@ LogicalResult Prefetcher::initialize() {
         mlir::cast<triton::gpu::DotOperandEncodingAttr>(bType.getEncoding());
     int aKWidth = aEnc.getKWidth();
     int bKWidth = bEnc.getKWidth();
-    assert(aKWidth == bKWidth);
+    // Volta operands hold four k values (kWidth 4) or four m/n values at one k
+    // (kWidth 1), independently for A and B; m8n8k4 consumes 4 k either way.
+    auto mmaParent = dyn_cast<NvidiaMmaEncodingAttr>(aEnc.getParent());
+    bool volta = mmaParent && mmaParent.isVolta();
+    assert(volta || aKWidth == bKWidth);
 
     auto kSize = aType.getShape().back();
 
     // works better with nvidia tensor cores
     unsigned elementWidth = aType.getElementTypeBitWidth();
-    if (aKWidth == 0)
+    if (volta)
+      prefetchWidth = 32;
+    else if (aKWidth == 0)
       prefetchWidth = 256 / elementWidth;
     else
       prefetchWidth = 8 * aKWidth;
@@ -280,12 +287,13 @@ void Prefetcher::emitPrologue() {
   OpBuilder builder(forOp);
 
   for (triton::DotOp dot : dots) {
-    Attribute dotEncoding = dot.getType().getEncoding();
+    Attribute aEncoding = dot.getA().getType().getEncoding();
+    Attribute bEncoding = dot.getB().getType().getEncoding();
     Value aPrefetched =
-        generatePrefetch(dot2aHeaderDef[dot], 0, true, dotEncoding, builder);
+        generatePrefetch(dot2aHeaderDef[dot], 0, true, aEncoding, builder);
     cloneElementwiseOps(aPrefetched, dot2aVals[dot], builder);
     Value bPrefetched =
-        generatePrefetch(dot2bHeaderDef[dot], 1, true, dotEncoding, builder);
+        generatePrefetch(dot2bHeaderDef[dot], 1, true, bEncoding, builder);
     cloneElementwiseOps(bPrefetched, dot2bVals[dot], builder);
 
     operand2headPrefetch[dot.getA()] = aPrefetched;
@@ -342,7 +350,8 @@ scf::ForOp Prefetcher::createNewForOp() {
     Operation *newOp = builder.clone(op, mapping);
     auto dot = dyn_cast<triton::DotOp>(&op);
     if (dot && dots.contains(dot)) {
-      Attribute dotEncoding = dot.getType().getEncoding();
+      Attribute aEncoding = dot.getA().getType().getEncoding();
+      Attribute bEncoding = dot.getB().getType().getEncoding();
       // prefetched dot
       Operation *firstDot = builder.clone(*dot, mapping);
       if (Value a = operand2headPrefetch.lookup(dot.getA()))
@@ -369,13 +378,11 @@ scf::ForOp Prefetcher::createNewForOp() {
         int64_t kShape = prefetchWidth;
         auto insertionPoint = builder.saveInsertionPoint();
         builder.setInsertionPoint(prevDot);
-        Value aRem =
-            generatePrefetch(mapping.lookup(dot2aLoopArg[dot]), 0, false,
-                             dotEncoding, builder, kOff, kShape);
+        Value aRem = generatePrefetch(mapping.lookup(dot2aLoopArg[dot]), 0,
+                                      false, aEncoding, builder, kOff, kShape);
         cloneElementwiseOps(aRem, dot2aVals[dot], builder);
-        Value bRem =
-            generatePrefetch(mapping.lookup(dot2bLoopArg[dot]), 1, false,
-                             dotEncoding, builder, kOff, kShape);
+        Value bRem = generatePrefetch(mapping.lookup(dot2bLoopArg[dot]), 1,
+                                      false, bEncoding, builder, kOff, kShape);
         cloneElementwiseOps(bRem, dot2bVals[dot], builder);
         builder.restoreInsertionPoint(insertionPoint);
         newOp = builder.clone(*dot, mapping);
@@ -404,14 +411,15 @@ scf::ForOp Prefetcher::createNewForOp() {
   for (Value v : forOp.getBody()->getTerminator()->getOperands())
     yieldValues.push_back(mapping.lookupOrDefault(v));
   for (triton::DotOp dot : dots) {
-    Attribute dotEncoding = dot.getType().getEncoding();
+    Attribute aEncoding = dot.getA().getType().getEncoding();
+    Attribute bEncoding = dot.getB().getType().getEncoding();
     Value aToYield = generatePrefetch(mapping.lookup(dot2aYield[dot]), 0, true,
-                                      dotEncoding, builder);
+                                      aEncoding, builder);
     cloneElementwiseOps(aToYield, dot2aVals[dot], builder);
     yieldValues.push_back(aToYield);
     // bToYield
     Value bToYield = generatePrefetch(mapping.lookup(dot2bYield[dot]), 1, true,
-                                      dotEncoding, builder);
+                                      bEncoding, builder);
     cloneElementwiseOps(bToYield, dot2bVals[dot], builder);
     yieldValues.push_back(bToYield);
   }

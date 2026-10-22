@@ -943,23 +943,34 @@ LinearLayout nvidiaMmaTile(MLIRContext *ctx, ArrayRef<unsigned> tileShape,
 // its own 8x8 tile. We place the four quadpairs (lane bits 2 and 3) as a 2x2
 // grid, so one warp covers 16x16. The bases below are the PTX fragment maps,
 // as (row, col) per register / lane bit:
-//   C (f32): register i of lane L holds row (L & 1) | (i & 2) | ((L >> 4) << 2),
+//   C (f32): register i of lane L holds row (L & 1) | (i & 2) | (L >> 4) * 4,
 //            col (i & 1) | (L & 2) | (i & 4); lane bit 2 adds 8 rows, bit 3
 //            adds 8 columns.
 //   A (row): lane L holds row (L & 3) | ((L >> 4) << 2), k 0..3 in registers;
 //            lane bit 2 adds 8 rows, A is broadcast over lane bit 3.
+//   A (col): lane L holds k (L & 3), rows 0..3 + ((L >> 4) << 2) in registers.
 //   B (col): lane L holds col (L & 3) | ((L >> 4) << 2), k 0..3 in registers;
 //            lane bit 3 adds 8 columns, B is broadcast over lane bit 2.
-static LinearLayout voltaMmaTile(MLIRContext *ctx, int opIdx,
+//   B (row): lane L holds k (L & 3), cols 0..3 + ((L >> 4) << 2) in registers.
+// The row/col forms take an operand that runs along k in memory (kWidth 4,
+// four k values per thread), the col/row forms one that runs along m or n
+// (kWidth 1), so every thread reads its four values as one vector.
+static LinearLayout voltaMmaTile(MLIRContext *ctx, int opIdx, int kWidth,
                                  ArrayRef<unsigned> repOrder) {
   auto dims = standardOutDimNames(ctx, 2);
   LinearLayout::BasesT bases;
-  if (opIdx == 0) {
+  if (opIdx == 0 && kWidth == 4) {
     bases[S("register")] = {{0, 1}, {0, 2}};
     bases[S("lane")] = {{1, 0}, {2, 0}, {8, 0}, {0, 0}, {4, 0}};
-  } else if (opIdx == 1) {
+  } else if (opIdx == 0) {
+    bases[S("register")] = {{1, 0}, {2, 0}};
+    bases[S("lane")] = {{0, 1}, {0, 2}, {8, 0}, {0, 0}, {4, 0}};
+  } else if (opIdx == 1 && kWidth == 4) {
     bases[S("register")] = {{1, 0}, {2, 0}};
     bases[S("lane")] = {{0, 1}, {0, 2}, {0, 0}, {0, 8}, {0, 4}};
+  } else if (opIdx == 1) {
+    bases[S("register")] = {{0, 1}, {0, 2}};
+    bases[S("lane")] = {{1, 0}, {2, 0}, {0, 0}, {0, 8}, {0, 4}};
   } else {
     bases[S("register")] = {{0, 1}, {2, 0}, {0, 4}};
     bases[S("lane")] = {{1, 0}, {0, 2}, {8, 0}, {0, 8}, {4, 0}};
@@ -969,7 +980,8 @@ static LinearLayout voltaMmaTile(MLIRContext *ctx, int opIdx,
   // are added later (repOrder), as in nvidiaMmaTile.
   LinearLayout ordered =
       identityStandardND(S("register"), SmallVector<unsigned>(2, 1), repOrder);
-  return ordered * tile.transposeOuts(llvm::to_vector(ordered.getOutDimNames()));
+  return ordered *
+         tile.transposeOuts(llvm::to_vector(ordered.getOutDimNames()));
 }
 
 LinearLayout
@@ -980,10 +992,12 @@ NvidiaMmaEncodingAttr::toLinearLayout(ArrayRef<int64_t> shape) const {
 
   if (isVolta()) {
     assert(rank == 2 && "Volta MMA supports rank-2 dots only");
-    auto ctaLayout = voltaMmaTile(ctx, /*opIdx=*/2, getRepOrder());
-    ctaLayout *= identityStandardND(S("warp"), getWarpsPerCTA(),
-                                    getMatrixOrder(rank, /*rowMajor*/ true))
-                     .transposeOuts(llvm::to_vector(ctaLayout.getOutDimNames()));
+    auto ctaLayout =
+        voltaMmaTile(ctx, /*opIdx=*/2, /*kWidth=*/0, getRepOrder());
+    ctaLayout *=
+        identityStandardND(S("warp"), getWarpsPerCTA(),
+                           getMatrixOrder(rank, /*rowMajor*/ true))
+            .transposeOuts(llvm::to_vector(ctaLayout.getOutDimNames()));
     return combineCtaCgaWithShape(ctaLayout, getCTALayout(), shape);
   }
 
@@ -1017,8 +1031,10 @@ LinearLayout nvidiaDotToLinearLayout(ArrayRef<int64_t> shape,
   MLIRContext *ctx = mma.getContext();
 
   if (mma.isVolta()) {
-    assert(rank == 2 && kWidth == 4 && "Volta MMA operands: rank 2, kWidth 4");
-    auto ctaLayout = voltaMmaTile(ctx, dot.getOpIdx(), dot.getRepOrder());
+    assert(rank == 2 && (kWidth == 4 || kWidth == 1) &&
+           "Volta MMA operands: rank 2, kWidth 4 or 1");
+    auto ctaLayout =
+        voltaMmaTile(ctx, dot.getOpIdx(), kWidth, dot.getRepOrder());
     ctaLayout *=
         broadcastedDotOperandLayout(ctx, mma.getWarpsPerCTA(),
                                     getMatrixOrder(rank, /*rowMajor*/ true),

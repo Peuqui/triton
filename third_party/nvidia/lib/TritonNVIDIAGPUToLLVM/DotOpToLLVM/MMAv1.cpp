@@ -21,8 +21,8 @@ Coord registerCoord(const LinearLayout &layout, int reg, MLIRContext *ctx) {
   auto kLane = StringAttr::get(ctx, "lane");
   auto kWarp = StringAttr::get(ctx, "warp");
   auto kBlock = StringAttr::get(ctx, "block");
-  auto out = layout.apply(
-      {{kRegister, reg}, {kLane, 0}, {kWarp, 0}, {kBlock, 0}});
+  auto out =
+      layout.apply({{kRegister, reg}, {kLane, 0}, {kWarp, 0}, {kBlock, 0}});
   return {out[0].second, out[1].second};
 }
 
@@ -43,7 +43,8 @@ std::map<Coord, Value> operandByCoord(Value llOperand, RankedTensorType type,
 // D = A * B + C on Volta tensor cores with mma.sync.m8n8k4 (fp16 operands,
 // fp32 accumulators). Register slots come from the MMAv1 linear layouts
 // (see voltaMmaTile in LinearLayoutConversions.cpp): per 16x16 warp tile each
-// quadpair runs one m8n8k4 per k step of 4.
+// quadpair runs one m8n8k4 per k step of 4, in the row/col form of the
+// operand layouts.
 LogicalResult convertMMA884(triton::DotOp op, triton::DotOp::Adaptor adaptor,
                             const LLVMTypeConverter *typeConverter,
                             ConversionPatternRewriter &rewriter) {
@@ -84,26 +85,41 @@ LogicalResult convertMMA884(triton::DotOp op, triton::DotOp::Adaptor adaptor,
     return b.bitcast(vec, i32_ty);
   };
 
+  // An operand with kWidth 4 holds four k values per thread (A .row, B .col),
+  // one with kWidth 1 four m or n values at one k (A .col, B .row).
+  auto kWidth = [](RankedTensorType type) {
+    return cast<triton::gpu::DotOperandEncodingAttr>(type.getEncoding())
+        .getKWidth();
+  };
+  bool aRow = kWidth(aType) == 4;
+  bool bCol = kWidth(bType) == 4;
+  std::string mmaName = std::string("mma.sync.aligned.m8n8k4.") +
+                        (aRow ? "row" : "col") + "." + (bCol ? "col" : "row") +
+                        ".f32.f16.f16.f32";
+
   int K = aType.getShape()[1];
-  Type retTy = LLVM::LLVMStructType::getLiteral(
-      ctx, SmallVector<Type>(8, f32_ty));
+  Type retTy =
+      LLVM::LLVMStructType::getLiteral(ctx, SmallVector<Type>(8, f32_ty));
   for (int k = 0; k < K; k += 4) {
     for (auto &[index, tile] : tiles) {
       auto &[origin, slots] = tile;
       auto [row, col] = origin;
+      auto aAt = [&](int i) {
+        return aValues.at(aRow ? Coord{row, k + i} : Coord{row + i, k});
+      };
+      auto bAt = [&](int i) {
+        return bValues.at(bCol ? Coord{k + i, col} : Coord{k, col + i});
+      };
       PTXBuilder builder;
       auto *dArgs = builder.newListOperand(8, "=f");
       auto *aArgs = builder.newListOperand(
-          {{pack(aValues.at({row, k}), aValues.at({row, k + 1})), "r"},
-           {pack(aValues.at({row, k + 2}), aValues.at({row, k + 3})), "r"}});
+          {{pack(aAt(0), aAt(1)), "r"}, {pack(aAt(2), aAt(3)), "r"}});
       auto *bArgs = builder.newListOperand(
-          {{pack(bValues.at({k, col}), bValues.at({k + 1, col})), "r"},
-           {pack(bValues.at({k + 2, col}), bValues.at({k + 3, col})), "r"}});
+          {{pack(bAt(0), bAt(1)), "r"}, {pack(bAt(2), bAt(3)), "r"}});
       auto *cArgs = builder.newListOperand();
       for (int i = 0; i < 8; ++i)
         cArgs->listAppend(builder.newOperand(acc[slots[i]], std::to_string(i)));
-      auto &mma =
-          *builder.create("mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32");
+      auto &mma = *builder.create(mmaName);
       mma(dArgs, aArgs, bArgs, cArgs);
       Value res = builder.launch(rewriter, loc, retTy);
       for (int i = 0; i < 8; ++i)

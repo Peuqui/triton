@@ -2478,9 +2478,9 @@ LogicalResult DotOperandEncodingAttr::verify(
     return emitError() << "ttg.dot_op parent parameter cannot be null";
   }
   if (auto parentAttr = mlir::dyn_cast<NvidiaMmaEncodingAttr>(parent)) {
-    if (parentAttr.isVolta() && kWidth != 4)
-      return emitError() << "ttg.dot_op kWidth parameter must be 4 for a "
-                            "Volta MMA parent";
+    if (parentAttr.isVolta() && kWidth != 4 && kWidth != 1)
+      return emitError() << "ttg.dot_op kWidth parameter must be 4 or 1 for "
+                            "a Volta MMA parent";
     if (kWidth != 0 && !(parentAttr.isVolta() || parentAttr.isAmpere() ||
                          parentAttr.isHopper()))
       return emitError() << "ttg.dot_op kWidth parameter can only be "
@@ -2754,8 +2754,12 @@ struct TritonGPUInferLayoutInterface
       return mlir::success();
     if (!aEncoding || !bEncoding)
       return op->emitError("mismatching encoding between A and B operands");
-    // Verify that the encodings are valid.
-    if (aEncoding.getKWidth() != bEncoding.getKWidth())
+    // Verify that the encodings are valid. Volta picks the m8n8k4 row/col form
+    // (kWidth 4 or 1) for A and B independently.
+    auto voltaParent =
+        dyn_cast_or_null<NvidiaMmaEncodingAttr>(aEncoding.getParent());
+    bool volta = voltaParent && voltaParent.isVolta();
+    if (!volta && aEncoding.getKWidth() != bEncoding.getKWidth())
       return op->emitError("mismatching kWidth between A and B operands");
 
     // Check if we have already selected an MMA version for Nvidia. If so,
