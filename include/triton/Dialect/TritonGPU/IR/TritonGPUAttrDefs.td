@@ -175,10 +175,26 @@ When vec=2, elements are swizzled in pairs of 2.  In other words, the element at
           return get(context, 1, 1, 1, order, CTALayout);
 
         // ---- begin Volta ----
-        // A Volta thread reads its four k values (kWidth) as one vector; the
-        // Ampere swizzle with kWidth 1 swizzles in units of 4 elements.
+        // A Volta thread reads its four k values (kWidth) as one vector, so
+        // the swizzle unit is 4 elements. A half warp, which one 64-bit shared
+        // load serves at a time, reads rows 0-3 and 8-11 of a 16-row MMAv1
+        // tile: the phase has to run over 16 rows, not Ampere's 8, or rows r
+        // and r + 8 share their banks.
         if (mmaEnc.isVolta()) {
-          return get(context, dotOpEnc.getOpIdx(), 1, shape, order, CTALayout, typeWidthInBit, needTrans);
+          int K = getShapePerCTA(CTALayout.getCTASplitNum(), shape)[order[0]];
+          int perPhase = std::max<int>(1024 / (typeWidthInBit * K), 1);
+          int vec = 4;
+          int mmaStride = 16;
+          if (needTrans)
+            std::swap(vec, mmaStride);
+          int rank = order.size();
+          int kDim = dotOpEnc.getOpIdx() == 0 ? rank - 1 : rank - 2;
+          if (order[0] != kDim)
+            std::swap(vec, mmaStride);
+          int maxPhase = std::max(
+              std::min<int>(mmaStride, 1024 / (vec * typeWidthInBit)), 1);
+          maxPhase = std::max(maxPhase / perPhase, 1);
+          return get(context, vec, perPhase, maxPhase, order, CTALayout);
         }
 
         // ---- begin Ampere & Hopper ----
