@@ -917,6 +917,13 @@ static Value promoteOperand(OpBuilder &builder, Location loc, Value operand,
   if (type::isFloat8(operandElType)) {
     return FpToFpOp::create(builder, loc, tensorPromotedType, operand);
   }
+  // FMA dots promote integer operands to their (integer) accumulator type;
+  // int8 dot operands are signed.
+  if (operandElType.isInteger()) {
+    if (promotedType.isInteger())
+      return arith::ExtSIOp::create(builder, loc, tensorPromotedType, operand);
+    return arith::SIToFPOp::create(builder, loc, tensorPromotedType, operand);
+  }
   return arith::ExtFOp::create(builder, loc, tensorPromotedType, operand);
 }
 
