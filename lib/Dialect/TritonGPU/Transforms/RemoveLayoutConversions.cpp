@@ -1412,6 +1412,32 @@ void LayoutRematerialization::hoistConvertDotOperand(
     return true;
   };
 
+  // A slice that only rearranges loaded data gains nothing from the hoist but
+  // its pipelining. Before sm_80 the pipeliner stages a load converted to a dot
+  // operand; through a reshape or a transpose the load would be converted to
+  // some other layout instead, and the operand would keep a single shared
+  // buffer with two barriers per iteration (RTX 8000: x read in the k order of
+  // a prepacked weight, W8A16 prefill 1.27x slower). Such chains stay
+  // converted after the rearrangement. Slices that compute (a decode) are
+  // still hoisted: GLM sparse MLA decodes its KV tile into both dot layouts
+  // that way; converted once after the decode it needs 160 KB of shared
+  // memory per CTA.
+  auto loadLeaf = [](Operation *op) {
+    return !op || isa<LoadOp, DescriptorLoadOp>(op);
+  };
+  if (isPreAmpereNvidia(convertOp->getParentOfType<ModuleOp>()) &&
+      llvm::all_of(slice,
+                   [&](Value v) {
+                     Operation *op = v.getDefiningOp();
+                     return loadLeaf(op) || isView(op) ||
+                            isa<ConvertLayoutOp, BroadcastOp>(op);
+                   }) &&
+      llvm::any_of(slice, [&](Value v) {
+        return loadLeaf(v.getDefiningOp()) &&
+               !isa<DotOperandEncodingAttr>(layout[v]);
+      }))
+    return;
+
   IRMapping mapping;
   OpBuilder builder(convertOp.getContext());
   for (Value v : slice) {

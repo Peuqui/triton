@@ -222,14 +222,18 @@ void createAsyncCopy(scf::ForOp forOp, tt::LoadOp loadOp, Value alloc,
 // the previous value and otherwise fed by loop invariants) runs between the
 // register-staged load and its store: the buffer holds the decoded operand, so
 // every element is decoded once per CTA instead of once per MMA fragment that
-// holds it, and the dot reads plain fp16 tiles as in a GEMM.
+// holds it, and the dot reads plain fp16 tiles as in a GEMM. Reshapes and
+// transposes may sit in the chain too, e.g. to bring a tile into the k order
+// of a prepacked weight.
 SmallVector<Operation *> getRegisterStagedDecode(scf::ForOp forOp,
                                                  Operation *loadOp) {
   SmallVector<Operation *> decode;
   Value value = loadOp->getResult(0);
   while (value.hasOneUse()) {
     Operation *user = *value.getUsers().begin();
-    if (user->getNumResults() != 1 || !user->hasTrait<OpTrait::Elementwise>() ||
+    bool rearranges = isa<tt::ReshapeOp, tt::TransOp>(user);
+    if (user->getNumResults() != 1 ||
+        !(user->hasTrait<OpTrait::Elementwise>() || rearranges) ||
         !isPure(user))
       break;
     if (llvm::any_of(user->getOperands(), [&](Value operand) {
