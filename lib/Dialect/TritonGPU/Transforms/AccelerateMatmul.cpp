@@ -33,12 +33,10 @@ namespace {
 // Volta (MMAv1, m8n8k4) and Turing (MMAv2, m16n8k8 / m8n8k16) have tensor-core
 // instructions for fp16 with fp32 accumulators; Turing also for fp16
 // accumulators and int8. bf16 and tf32 have no instruction on these cards and
-// stay on FMA. Turing runs batched (3D) dots through MMAv2's batch dimension;
-// Volta's MMAv1 layout is two-dimensional.
+// stay on FMA. Batched (3D) dots run per batch through the batch dimension of
+// the MMA layout on both.
 static bool sm7xSupportsMMA(DotOp dotOp, int computeCapability) {
   bool isTuring = computeCapability == 75;
-  if (dotOp.getType().getRank() != 2 && !isTuring)
-    return false;
   Type aElemTy = dotOp.getA().getType().getElementType();
   Type bElemTy = dotOp.getB().getType().getElementType();
   Type dElemTy = dotOp.getType().getElementType();
@@ -259,8 +257,9 @@ getWarpsPerTile(DotOpInterface dotOp, const ArrayRef<int64_t> shape,
   switch (version) {
   case 1:
     // Volta: a warp covers its four 8x8 quadpair tiles, 16x16 or 8x32
-    return warpsPerTileV2(dotOp, shape, numWarps,
-                          {instrShape[0], instrShape[1]});
+    return warpsPerTileV2(
+        dotOp, shape, numWarps,
+        {instrShape[instrShape.size() - 2], instrShape.back()});
   case 2:
     return warpsPerTileV2(dotOp, shape, numWarps, {16, 8});
   case 3:
@@ -386,7 +385,8 @@ static Value convertDotOperandForMMA(Value v, int opIdx, int bitwidth,
     Value source = v;
     while (auto cvt = source.getDefiningOp<ConvertLayoutOp>())
       source = cvt.getSrc();
-    unsigned kDim = opIdx == 0 ? 1 : 0;
+    unsigned rank = vType.getRank();
+    unsigned kDim = opIdx == 0 ? rank - 1 : rank - 2;
     if (getOrderForMemory(cast<RankedTensorType>(source.getType()))[0] != kDim)
       newVEncoding = DotOperandEncodingAttr::get(v.getContext(), opIdx, mma,
                                                  /*kWidth=*/1);

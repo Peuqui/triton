@@ -185,8 +185,10 @@ When vec=2, elements are swizzled in pairs of 2.  In other words, the element at
           int K = getShapePerCTA(CTALayout.getCTASplitNum(), shape)[order[0]];
           int perPhase = std::max<int>(1024 / (typeWidthInBit * K), 1);
           int vec = 4;
-          int mmaStride =
-              mmaEnc.getInstrShape()[dotOpEnc.getOpIdx() == 0 ? 0 : 1];
+          auto instrShape = mmaEnc.getInstrShape();
+          int mmaStride = dotOpEnc.getOpIdx() == 0
+                              ? instrShape[instrShape.size() - 2]
+                              : instrShape.back();
           if (needTrans)
             std::swap(vec, mmaStride);
           int rank = order.size();
