@@ -258,8 +258,9 @@ getWarpsPerTile(DotOpInterface dotOp, const ArrayRef<int64_t> shape,
                 const SmallVector<unsigned, 3> &instrShape) {
   switch (version) {
   case 1:
-    // Volta: a warp covers 16x16 (four 8x8 quadpair tiles)
-    return warpsPerTileV2(dotOp, shape, numWarps, {16, 16});
+    // Volta: a warp covers its four 8x8 quadpair tiles, 16x16 or 8x32
+    return warpsPerTileV2(dotOp, shape, numWarps,
+                          {instrShape[0], instrShape[1]});
   case 2:
     return warpsPerTileV2(dotOp, shape, numWarps, {16, 8});
   case 3:

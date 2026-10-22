@@ -42,9 +42,9 @@ std::map<Coord, Value> operandByCoord(Value llOperand, RankedTensorType type,
 
 // D = A * B + C on Volta tensor cores with mma.sync.m8n8k4 (fp16 operands,
 // fp32 accumulators). Register slots come from the MMAv1 linear layouts
-// (see voltaMmaTile in LinearLayoutConversions.cpp): per 16x16 warp tile each
-// quadpair runs one m8n8k4 per k step of 4, in the row/col form of the
-// operand layouts.
+// (see voltaMmaTile in LinearLayoutConversions.cpp): per warp tile (16x16, or
+// 8x32 for at most 8 rows) each quadpair runs one m8n8k4 per k step of 4, in
+// the row/col form of the operand layouts.
 LogicalResult convertMMA884(triton::DotOp op, triton::DotOp::Adaptor adaptor,
                             const LLVMTypeConverter *typeConverter,
                             ConversionPatternRewriter &rewriter) {
@@ -61,7 +61,7 @@ LogicalResult convertMMA884(triton::DotOp op, triton::DotOp::Adaptor adaptor,
   auto aValues = operandByCoord(adaptor.getA(), aType, loc, rewriter);
   auto bValues = operandByCoord(adaptor.getB(), bType, loc, rewriter);
 
-  // Accumulator registers per 16x16 tile, ordered as the eight fp32 results
+  // Accumulator registers per warp tile, ordered as the eight fp32 results
   // of m8n8k4. The first three register bits of the MMAv1 layout are that
   // fragment index ((col & 1) | (row & 2) | (col & 4) for lane 0); the higher
   // bits count tiles. An output smaller than a tile folds its coordinates
@@ -97,7 +97,13 @@ LogicalResult convertMMA884(triton::DotOp op, triton::DotOp::Adaptor adaptor,
                         (aRow ? "row" : "col") + "." + (bCol ? "col" : "row") +
                         ".f32.f16.f16.f32";
 
+  // A col operand holds four rows per thread, a B row operand four columns.
+  // An operand with fewer rows or columns folds them like the accumulator
+  // (rows 2 and 3 of a 2-row A are rows 0 and 1); they only feed results that
+  // are dropped.
   int K = aType.getShape()[1];
+  int aRows = aType.getShape()[0];
+  int bCols = bType.getShape()[1];
   Type retTy =
       LLVM::LLVMStructType::getLiteral(ctx, SmallVector<Type>(8, f32_ty));
   for (int k = 0; k < K; k += 4) {
@@ -105,10 +111,12 @@ LogicalResult convertMMA884(triton::DotOp op, triton::DotOp::Adaptor adaptor,
       auto &[origin, slots] = tile;
       auto [row, col] = origin;
       auto aAt = [&](int i) {
-        return aValues.at(aRow ? Coord{row, k + i} : Coord{row + i, k});
+        return aValues.at(aRow ? Coord{row, k + i}
+                               : Coord{(row + i) % aRows, k});
       };
       auto bAt = [&](int i) {
-        return bValues.at(bCol ? Coord{k + i, col} : Coord{k, col + i});
+        return bValues.at(bCol ? Coord{k + i, col}
+                               : Coord{k, (col + i) % bCols});
       };
       PTXBuilder builder;
       auto *dArgs = builder.newListOperand(8, "=f");

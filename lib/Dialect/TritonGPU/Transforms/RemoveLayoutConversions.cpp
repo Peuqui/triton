@@ -1333,19 +1333,26 @@ void LayoutRematerialization::hoistConvertDotOperand(
   if (result.failed())
     return;
 
+  // Hoisting moves the decode into the dot-operand layout, so it runs once per
+  // thread that holds an element. Volta's 16x16 MMAv1 tile holds every A and B
+  // element in two quadpairs (V100 W8A16 prefill measured 1.7x slower when
+  // decoding there); such operands keep being converted after the decode. B of
+  // the 8x32 tile lives in one quadpair and is hoisted like on other targets.
+  auto dotEnc = dyn_cast<DotOperandEncodingAttr>(targetType.getEncoding());
+  auto mmaParent =
+      dotEnc ? dyn_cast<NvidiaMmaEncodingAttr>(dotEnc.getParent()) : nullptr;
+  if (mmaParent && mmaParent.isVolta() &&
+      toLinearLayout(targetType)
+              .getFreeVariableMasks()
+              .lookup(StringAttr::get(convertOp.getContext(), "lane")) != 0)
+    return;
+
   // Before sm_80 the pipeliner prefetches the next tile into registers: the
   // load becomes a loop-carried value whose yield is the load. Converting that
   // value at the top of the loop body keeps a narrow tile (an 8-bit weight)
   // narrow through shared memory instead of converting its widened result.
-  // Volta's MMAv1 operands hold every element in several threads, so decoding
-  // there would repeat the work (V100 W8A16 prefill measured 1.7x slower); its
-  // operands keep being converted after the decode.
-  auto dotEnc = dyn_cast<DotOperandEncodingAttr>(targetType.getEncoding());
-  auto mmaParent =
-      dotEnc ? dyn_cast<NvidiaMmaEncodingAttr>(dotEnc.getParent()) : nullptr;
-  bool narrowThroughShared = mmaParent && !mmaParent.isVolta();
   auto registerPipelinedLoad = [&](Value v) -> bool {
-    if (!narrowThroughShared)
+    if (!mmaParent)
       return false;
     auto arg = dyn_cast<BlockArgument>(v);
     if (!arg)
