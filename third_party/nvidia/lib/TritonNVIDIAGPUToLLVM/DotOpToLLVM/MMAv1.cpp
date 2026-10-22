@@ -61,14 +61,19 @@ LogicalResult convertMMA884(triton::DotOp op, triton::DotOp::Adaptor adaptor,
   auto bValues = operandByCoord(adaptor.getB(), bType, loc, rewriter);
 
   // Accumulator registers per 16x16 tile, ordered as the eight fp32 results
-  // of m8n8k4: fragment index (col & 1) | (row & 2) | (col & 4) for lane 0.
+  // of m8n8k4. The first three register bits of the MMAv1 layout are that
+  // fragment index ((col & 1) | (row & 2) | (col & 4) for lane 0); the higher
+  // bits count tiles. An output smaller than a tile folds its coordinates
+  // (a 2x4 result maps row 2 onto row 0), so the slot comes from the register
+  // index and each tile's origin from its first register.
   SmallVector<Value> acc = unpackLLElements(loc, adaptor.getC(), rewriter);
   auto dLayout = triton::gpu::toLinearLayout(dType);
-  std::map<Coord, std::array<int, 8>> tiles;
+  std::map<int, std::pair<Coord, std::array<int, 8>>> tiles;
   for (int reg = 0; reg < (int)acc.size(); ++reg) {
-    auto [row, col] = registerCoord(dLayout, reg, ctx);
-    auto &slots = tiles.try_emplace({row & ~15, col & ~15}).first->second;
-    slots[(col & 1) | (row & 2) | (col & 4)] = reg;
+    auto &tile = tiles[reg >> 3];
+    if ((reg & 7) == 0)
+      tile.first = registerCoord(dLayout, reg, ctx);
+    tile.second[reg & 7] = reg;
   }
 
   Type packTy = vec_ty(f16_ty, 2);
@@ -83,8 +88,9 @@ LogicalResult convertMMA884(triton::DotOp op, triton::DotOp::Adaptor adaptor,
   Type retTy = LLVM::LLVMStructType::getLiteral(
       ctx, SmallVector<Type>(8, f32_ty));
   for (int k = 0; k < K; k += 4) {
-    for (auto &[tile, slots] : tiles) {
-      auto [row, col] = tile;
+    for (auto &[index, tile] : tiles) {
+      auto &[origin, slots] = tile;
+      auto [row, col] = origin;
       PTXBuilder builder;
       auto *dArgs = builder.newListOperand(8, "=f");
       auto *aArgs = builder.newListOperand(
