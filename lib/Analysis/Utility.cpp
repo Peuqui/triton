@@ -33,21 +33,17 @@ SmallVector<unsigned> ReduceOpHelper::getOrderWithAxisAtBeginning() {
   return order;
 }
 
-// Thread offset is the thread index offset of two adjacent threads on the
-// reduction axis within the warp.
-unsigned ReduceOpHelper::getThreadOffsetOnReductionAxis() {
+SmallVector<unsigned> ReduceOpHelper::getLaneMasksOnReductionAxis() {
   auto *ctx = srcEncoding.getContext();
   auto linearLayout = toLinearLayout(srcTy);
   auto kLane = mlir::StringAttr::get(ctx, "lane");
-  const auto &bases = linearLayout.getBases();
-  const auto &lanes = bases.find(kLane)->second;
-  auto offset = 1;
-  for (const auto &lane : lanes) {
-    if (lane[axis] != 0)
-      break;
-    offset *= 2;
+  const auto &lanes = linearLayout.getBases().find(kLane)->second;
+  SmallVector<unsigned> masks;
+  for (unsigned bit = 0; bit < lanes.size(); ++bit) {
+    if (lanes[bit][axis] != 0)
+      masks.push_back(1u << bit);
   }
-  return offset;
+  return masks;
 }
 
 // Cases where distributed shared memory is not required in ConvertLayout:

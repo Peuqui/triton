@@ -161,29 +161,46 @@ private:
     if (success)
       return;
 
-    for (unsigned N = numLaneToReduce / 2; N > 0; N >>= 1) {
+    SmallVector<unsigned> laneMasks;
+    for (unsigned N = 1; N < numLaneToReduce; N <<= 1)
+      laneMasks.push_back(N * interleave);
+    shuffleReduce(rewriter, loc, acc, op, laneMasks, pred);
+  }
+
+  // Butterfly reduction over the given lane XOR masks, highest mask first.
+  void shuffleReduce(ConversionPatternRewriter &rewriter, Location loc,
+                     SmallVector<Value> &acc, triton::ReduceOp op,
+                     ArrayRef<unsigned> laneMasks, Value pred = {}) const {
+    for (unsigned mask : llvm::reverse(laneMasks)) {
       SmallVector<Value> shfl(acc.size());
       for (unsigned i = 0; i < acc.size(); ++i) {
-        shfl[i] = targetInfo.shuffleXor(rewriter, loc, acc[i], N * interleave);
+        shfl[i] = targetInfo.shuffleXor(rewriter, loc, acc[i], mask);
       }
       accumulate(op.getLoc(), rewriter, op.getCombineOp(), acc, shfl, pred);
     }
   }
 
-  // Reduce across threads within each warp.
+  // Reduce across threads within each warp. Contiguous lane bits go through
+  // warpReduce (hardware reductions need them); others shuffle per lane bit.
   void
   reduceWithinWarps(ReduceOpHelper &helper,
                     std::map<SmallVector<unsigned>, SmallVector<Value>> &accs,
                     ConversionPatternRewriter &rewriter) const {
     triton::ReduceOp op = helper.getOperation();
-    unsigned sizeIntraWarps = helper.getIntraWarpSizeWithUniqueData();
-    unsigned threadOffsetOnReductionAxis =
-        helper.getThreadOffsetOnReductionAxis();
+    SmallVector<unsigned> laneMasks = helper.getLaneMasksOnReductionAxis();
+    bool contiguous = true;
+    for (unsigned i = 1; i < laneMasks.size(); ++i)
+      contiguous &= laneMasks[i] == laneMasks[0] << i;
     for (auto it : accs) {
       const SmallVector<unsigned> &key = it.first;
       SmallVector<Value> &acc = accs[key];
-      warpReduce(rewriter, op.getLoc(), acc, op, sizeIntraWarps,
-                 threadOffsetOnReductionAxis);
+      if (laneMasks.empty())
+        continue;
+      if (contiguous)
+        warpReduce(rewriter, op.getLoc(), acc, op, 1u << laneMasks.size(),
+                   laneMasks[0]);
+      else
+        shuffleReduce(rewriter, op.getLoc(), acc, op, laneMasks);
     }
   }
 

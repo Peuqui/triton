@@ -48,7 +48,10 @@ public:
 
   triton::ReduceOp getOperation() { return op; }
 
-  unsigned getThreadOffsetOnReductionAxis();
+  // XOR masks of the lane bits that move along the reduction axis, lowest
+  // first. They need not be contiguous: Volta's MMA layout puts the columns of
+  // a tile on lane bits 1 and 3.
+  SmallVector<unsigned> getLaneMasksOnReductionAxis();
 
   bool isWarpSynchronous();
 
