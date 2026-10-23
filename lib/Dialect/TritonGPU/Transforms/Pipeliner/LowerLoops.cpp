@@ -218,40 +218,93 @@ void createAsyncCopy(scf::ForOp forOp, tt::LoadOp loadOp, Value alloc,
 // the iteration of the load anyway. V100 fp16 GEMM measured 2-8 % faster that
 // way; Turing keeps the load stage (RTX 8000 4096^3 measured 3 % slower) and
 // the barrier.
-// A dequant between load and dot (pure elementwise ops, each the only user of
-// the previous value and otherwise fed by loop invariants) runs between the
-// register-staged load and its store: the buffer holds the decoded operand, so
-// every element is decoded once per CTA instead of once per MMA fragment that
-// holds it, and the dot reads plain fp16 tiles as in a GEMM. Reshapes and
-// transposes may sit in the chain too, e.g. to bring a tile into the k order
-// of a prepacked weight.
-SmallVector<Operation *> getRegisterStagedDecode(scf::ForOp forOp,
-                                                 Operation *loadOp) {
-  SmallVector<Operation *> decode;
-  Value value = loadOp->getResult(0);
-  while (value.hasOneUse()) {
-    Operation *user = *value.getUsers().begin();
-    bool rearranges = isa<tt::ReshapeOp, tt::TransOp>(user);
-    if (user->getNumResults() != 1 ||
-        !(user->hasTrait<OpTrait::Elementwise>() || rearranges) ||
-        !isPure(user))
-      break;
-    if (llvm::any_of(user->getOperands(), [&](Value operand) {
-          return operand != value && !forOp.isDefinedOutsideOfLoop(operand);
-        }))
-      break;
-    decode.push_back(user);
-    value = user->getResult(0);
+// A second operand of the dequant may come from the loop when everything it
+// depends on there is a load or pure computation (a group scale and its
+// decode); the copy moves that computation into its stage.
+bool isStageableSideOperand(scf::ForOp forOp, Value value,
+                            DenseSet<Value> &seen) {
+  if (forOp.isDefinedOutsideOfLoop(value) || value == forOp.getInductionVar())
+    return true;
+  if (!seen.insert(value).second)
+    return true;
+  Operation *op = value.getDefiningOp();
+  if (!op || isa<tt::DotOpInterface>(op) ||
+      !(isPure(op) || isa<tt::LoadOp>(op)))
+    return false;
+  return llvm::all_of(op->getOperands(), [&](Value operand) {
+    return isStageableSideOperand(forOp, operand, seen);
+  });
+}
+
+// A dequant between load and dot runs between the register-staged load and its
+// store: the buffer holds the decoded operand, so every element is decoded once
+// per CTA instead of once per MMA fragment that holds it, and the dot reads
+// plain fp16 tiles as in a GEMM. The dequant is every op the loaded tile flows
+// through up to the one value the dot operand is made of: pure elementwise ops
+// (several results allowed, e.g. both nibbles of a byte), reshapes, transposes,
+// joins and splits (bringing a tile into the k order of a prepacked weight),
+// with group scales loaded in the loop as further operands
+// (isStageableSideOperand).
+struct RegisterStagedDecode {
+  SmallVector<Operation *> ops; // in program order
+  Value staged;
+};
+
+RegisterStagedDecode getRegisterStagedDecode(scf::ForOp forOp,
+                                             Operation *loadOp) {
+  RegisterStagedDecode none{{}, loadOp->getResult(0)};
+  SetVector<Operation *> region;
+  SmallVector<Value> worklist{loadOp->getResult(0)};
+  Value staged;
+  DenseSet<Value> seen;
+  bool incompatible = false;
+  while (!worklist.empty()) {
+    Value value = worklist.pop_back_val();
+    if (value != loadOp->getResult(0) &&
+        getSharedEncIfAllUsersAreDotEnc(value, incompatible).has_value()) {
+      if (staged && staged != value)
+        return none; // more than one value would need a buffer
+      staged = value;
+      continue;
+    }
+    for (Operation *user : value.getUsers()) {
+      bool rearranges =
+          isa<tt::ReshapeOp, tt::TransOp, tt::JoinOp, tt::SplitOp>(user);
+      if (!(user->hasTrait<OpTrait::Elementwise>() || rearranges) ||
+          !isPure(user) || user->getBlock() != forOp.getBody())
+        return none;
+      if (llvm::any_of(user->getOperands(), [&](Value operand) {
+            Operation *def = operand.getDefiningOp();
+            return !(def && (def == loadOp || region.contains(def))) &&
+                   !isStageableSideOperand(forOp, operand, seen);
+          }))
+        return none;
+      if (region.insert(user))
+        llvm::append_range(worklist, user->getResults());
+    }
   }
-  return decode;
+  if (!staged || region.empty() || staged.getDefiningOp()->getNumResults() != 1)
+    return none;
+  // Every value of the region must end in the staged one: a result used
+  // elsewhere would be computed in the copy's stage for a later consumer.
+  for (Operation *op : region)
+    for (Value result : op->getResults())
+      if (result != staged &&
+          llvm::any_of(result.getUsers(),
+                       [&](Operation *u) { return !region.contains(u); }))
+        return none;
+  SmallVector<Operation *> ops(region.begin(), region.end());
+  llvm::sort(ops,
+             [](Operation *a, Operation *b) { return a->isBeforeInBlock(b); });
+  return {ops, staged};
 }
 
 void createRegisterStagedCopy(scf::ForOp forOp, tt::LoadOp loadOp,
-                              ArrayRef<Operation *> decode, Value alloc,
+                              const RegisterStagedDecode &decode, Value alloc,
                               Value insertIdx, Value extractIdx,
                               CoarseSchedule &schedule) {
   OpBuilderForStage builder(loadOp.getLoc(), forOp, schedule);
-  Operation *staged = decode.empty() ? loadOp.getOperation() : decode.back();
+  Operation *staged = decode.staged.getDefiningOp();
   Operation *firstUse = getFirstUseOfPipelinedOp({staged}, forOp, schedule);
   assert(firstUse && "LoadOp has no users");
   auto [useStage, useCluster] = schedule[firstUse];
@@ -278,13 +331,23 @@ void createRegisterStagedCopy(scf::ForOp forOp, tt::LoadOp loadOp,
   schedule.insert(loadOp, loadStage, issueCluster);
   schedule.insertDepsOfOp(loadOp, loadStage, issueCluster, /*includeArg=*/true,
                           /*insertIfEarlier=*/true);
-  Operation *beforeStore = loadOp;
-  for (Operation *op : decode) {
-    op->moveAfter(beforeStore);
+  // The decode runs in the store's stage and cluster, right before the store;
+  // a side operand it takes from the loop (a group scale and its decode)
+  // comes along unless it runs earlier already. Dragging the decode's own
+  // dependencies instead would pull the whole chain next to the load issue.
+  for (Operation *op : decode.ops) {
     schedule.insert(op, loadStage, storeCluster);
-    beforeStore = op;
+    for (Value operand : op->getOperands()) {
+      Operation *def = operand.getDefiningOp();
+      if (!def || def == loadOp.getOperation() ||
+          llvm::is_contained(decode.ops, def) || !forOp->isProperAncestor(def))
+        continue;
+      schedule.insertMinimum(def, loadStage, storeCluster);
+      schedule.insertDepsOfOp(def, loadStage, storeCluster,
+                              /*includeArg=*/false, /*insertIfEarlier=*/true);
+    }
   }
-  builder.setInsertionPointAfter(beforeStore);
+  builder.setInsertionPointAfter(staged);
   builder.setStageCluster({loadStage, storeCluster});
   Value view = createSingleBufferView(builder, alloc, insertIdx);
   auto store = ttg::LocalStoreOp::create(builder, staged->getResult(0), view);
@@ -368,8 +431,8 @@ struct AsyncLoad {
   SharedEncodingTrait sharedEncoding;
   // Staged through registers into shared memory (no cp.async before sm_80).
   bool registerStaged = false;
-  // Elementwise ops decoding the loaded tile before it is staged.
-  SmallVector<Operation *> decode;
+  // The ops decoding the loaded tile before it is staged (register staging).
+  RegisterStagedDecode decode;
 };
 struct LoadGroupInfo {
   Value insertIdx;
@@ -600,12 +663,10 @@ scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
         // into double-buffered shared memory. At distance 1 (num_stages 2)
         // they stay pipelined in registers, which keeps small tiles (decode
         // GEMMs) at more CTAs per SM.
-        SmallVector<Operation *> decode = getRegisterStagedDecode(forOp, &op);
-        Value staged =
-            decode.empty() ? op.getResult(0) : decode.back()->getResult(0);
+        RegisterStagedDecode decode = getRegisterStagedDecode(forOp, &op);
         bool incompatible = false;
         auto dotEncoding =
-            getSharedEncIfAllUsersAreDotEnc(staged, incompatible);
+            getSharedEncIfAllUsersAreDotEnc(decode.staged, incompatible);
         if (dotEncoding && *dotEncoding) {
           auto &asyncLoad = asyncLoads[&op];
           asyncLoad.stageDiff = stageDiff;
@@ -636,8 +697,9 @@ scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
 
   for (auto &[loadOp, asyncLoad] : asyncLoads) {
     // A decoded operand is buffered in its decoded type
-    Operation *staged =
-        asyncLoad.decode.empty() ? loadOp : asyncLoad.decode.back();
+    Operation *staged = asyncLoad.registerStaged
+                            ? asyncLoad.decode.staged.getDefiningOp()
+                            : loadOp;
     Value alloc = createAlloc(forOp, staged, asyncLoad.sharedEncoding,
                               asyncLoad.stageDiff);
     asyncLoad.alloc = alloc;
